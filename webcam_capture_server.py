@@ -429,12 +429,7 @@ class WebcamCaptureGUI:
         self.root = root_window
         self.root.title("Webcam Capture Server")
 
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        win_w = min(1150, sw - 40)
-        win_h = min(780,  sh - 60)
-        self.root.geometry(f"{win_w}x{win_h}")
-        self.root.minsize(850, 620)
+        self.root.geometry("1200x1200")   # larghezza x altezza in pixel 
         self.root.resizable(True, True)
 
         self._live_running   = False
