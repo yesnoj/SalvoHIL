@@ -40,7 +40,8 @@ class AppState:
         self.webcam_exposure   = -8
         self.webcam_focus      = 73
 
-        self.roi = None
+        self.rois = {}   # {id(int): (x1, y1, x2, y2, rotation)}
+                         # rotation: 0, 90, 180, 270
 
         self.server_running = False
         self.server_socket  = None
@@ -187,16 +188,28 @@ def grab_fresh_frame_for_capture():
         return app.latest_frame.copy()
 
 
-def capture_roi(frame):
-    if app.roi is None:
+def capture_roi(frame, area_id):
+    """Ritaglia il frame sull'area e applica la rotazione configurata."""
+    roi = app.rois.get(area_id)
+    if roi is None:
         return frame
-    x1, y1, x2, y2 = app.roi
+    x1, y1, x2, y2, rotation = roi
     h, w = frame.shape[:2]
     x1, x2 = max(0, min(x1, w)), max(0, min(x2, w))
     y1, y2 = max(0, min(y1, h)), max(0, min(y2, h))
     if x2 <= x1 or y2 <= y1:
         return frame
-    return frame[y1:y2, x1:x2]
+    cropped = frame[y1:y2, x1:x2]
+
+    # Applica rotazione
+    if rotation == 90:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 180:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_180)
+    elif rotation == 270:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    return cropped
 
 
 def save_image(frame, filepath):
@@ -275,12 +288,30 @@ def _process_command(command, log_fn):
     if command.strip().upper() == "STATUS":
         if app.cap is None or not app.cap.isOpened():
             return "NOT_READY:webcam non aperta"
-        if app.roi is None:
-            return "NOT_READY:area non selezionata"
-        return "READY"
+        if not app.rois:
+            return "NOT_READY:nessuna area selezionata"
+        return f"READY:aree={list(app.rois.keys())}"
 
     if command.upper().startswith("CAPTURE:"):
-        filename = command[len("CAPTURE:"):].strip()
+        rest = command[len("CAPTURE:"):].strip()
+
+        # Protocollo: CAPTURE:area_id:nome_file
+        # es.  CAPTURE:1:misura.jpg   oppure   CAPTURE:2:C:/foto/img.png
+        parts = rest.split(":", 1)
+        if len(parts) != 2:
+            return ("ERROR:formato errato. Usa CAPTURE:area_id:nome_file  "
+                    f"(es. CAPTURE:1:immagine.jpg)  |  aree disponibili: {list(app.rois.keys())}")
+
+        try:
+            area_id = int(parts[0].strip())
+        except ValueError:
+            return f"ERROR:area_id deve essere un numero intero (ricevuto: {parts[0]!r})"
+
+        if area_id not in app.rois:
+            return (f"ERROR:area {area_id} non esiste  |  "
+                    f"aree disponibili: {list(app.rois.keys())}")
+
+        filename = parts[1].strip()
         if not filename:
             return "ERROR:nome file mancante"
 
@@ -293,15 +324,14 @@ def _process_command(command, log_fn):
         if dirpath:
             os.makedirs(dirpath, exist_ok=True)
 
-        # Usa grab_fresh_frame_for_capture() → include il lock internamente
         frame = grab_fresh_frame_for_capture()
         if frame is None:
             return "ERROR:impossibile acquisire frame dalla webcam"
 
-        roi_frame = capture_roi(frame)
+        roi_frame = capture_roi(frame, area_id)
 
         if save_image(roi_frame, filepath):
-            log_fn(f"[SERVER] Immagine salvata: {filepath}")
+            log_fn(f"[SERVER] Area {area_id} → {filepath}")
             return f"OK:{filepath}"
         else:
             return f"ERROR:salvataggio fallito → {filepath}"
@@ -429,15 +459,17 @@ class WebcamCaptureGUI:
         self.root = root_window
         self.root.title("Webcam Capture Server")
 
-        self.root.geometry("1200x1200")   # larghezza x altezza in pixel 
+        self.root.minsize(850, 620)
         self.root.resizable(True, True)
+        self.root.state("zoomed")   # fullscreen su Windows; su Linux/Mac: self.root.attributes("-zoomed", True)
 
         self._live_running   = False
 
         # Stato selezione area direttamente sull'anteprima
-        self._selecting_area = False   # True quando l'utente sta disegnando
-        self._sel_start      = None    # (x, y) in coordinate display
-        self._sel_current    = None    # (x, y) in coordinate display
+        self._selecting_area = False
+        self._sel_start      = None
+        self._sel_current    = None
+        self._next_area_id   = 1     # ID che verrà assegnato alla prossima area
         # Parametri di scala usati nell'ultimo frame visualizzato
         # servono per convertire coordinate display → coordinate frame reale
         self._disp_scale     = 1.0
@@ -515,20 +547,55 @@ class WebcamCaptureGUI:
         self.live_btn.pack(fill="x", padx=5, pady=5)
 
         # ── Area di Acquisizione ─────────────────
-        frm4 = tk.LabelFrame(p, text="Area di Acquisizione", font=("Arial", 9, "bold"))
+        frm4 = tk.LabelFrame(p, text="Aree di Acquisizione", font=("Arial", 9, "bold"))
         frm4.pack(**opt)
 
-        self.roi_label = tk.Label(frm4, text="Nessuna area selezionata",
-                                  font=("Arial", 8), fg="red")
-        self.roi_label.pack(fill="x", padx=5, pady=2)
+        # Listbox con le aree definite
+        list_frame = tk.Frame(frm4)
+        list_frame.pack(fill="x", padx=5, pady=(4, 0))
 
-        tk.Button(frm4, text="✏  Seleziona Area sull'anteprima",
+        self.area_listbox = tk.Listbox(list_frame, height=5, font=("Courier", 8),
+                                       selectmode=tk.SINGLE, bg="#f9f9f9",
+                                       xscrollcommand=lambda *a: sb_h.set(*a))
+        self.area_listbox.grid(row=0, column=0, sticky="nsew")
+
+        sb_areas = tk.Scrollbar(list_frame, orient="vertical",
+                                command=self.area_listbox.yview)
+        sb_areas.grid(row=0, column=1, sticky="ns")
+
+        sb_h = tk.Scrollbar(list_frame, orient="horizontal",
+                            command=self.area_listbox.xview)
+        sb_h.grid(row=1, column=0, sticky="ew")
+
+        self.area_listbox.configure(yscrollcommand=sb_areas.set,
+                                    xscrollcommand=sb_h.set)
+
+        list_frame.columnconfigure(0, weight=1)
+
+        rot_row = tk.Frame(frm4)
+        rot_row.pack(fill="x", padx=5, pady=(4, 0))
+        tk.Label(rot_row, text="Rotazione nuova area:", font=("Arial", 8)).pack(side="left")
+        self.rotation_var = tk.StringVar(value="0°")
+        rot_cb = ttk.Combobox(rot_row, textvariable=self.rotation_var,
+                              values=["0°", "90°", "180°", "270°"],
+                              state="readonly", width=6)
+        rot_cb.pack(side="left", padx=6)
+
+        btn_row = tk.Frame(frm4)
+        btn_row.pack(fill="x", padx=5, pady=3)
+
+        tk.Button(btn_row, text="✏  Aggiungi Area",
                   command=self._select_area,
                   bg="#ffd080", font=("Arial", 9, "bold"), height=2
-                  ).pack(fill="x", padx=5, pady=3)
+                  ).pack(side="left", fill="x", expand=True, padx=(0, 2))
 
-        tk.Button(frm4, text="Rimuovi Area  (usa intero frame)",
-                  command=self._clear_roi,
+        tk.Button(btn_row, text="🗑  Rimuovi",
+                  command=self._remove_selected_area,
+                  bg="#ff9999", font=("Arial", 9, "bold"), height=2
+                  ).pack(side="left", fill="x", expand=True)
+
+        tk.Button(frm4, text="Rimuovi tutte le aree",
+                  command=self._clear_all_areas,
                   font=("Arial", 8)
                   ).pack(fill="x", padx=5, pady=(0, 4))
 
@@ -695,17 +762,44 @@ class WebcamCaptureGUI:
         # Cambia il cursore per indicare la modalità disegno
         self.preview_panel.config(cursor="crosshair")
 
-        self._log("[INFO] Disegna l'area direttamente sull'anteprima."
+        # Calcola il prossimo ID disponibile
+        next_id = 1
+        while next_id in app.rois:
+            next_id += 1
+        self._next_area_id = next_id
+
+        self._log(f"[INFO] Disegna l'area {next_id} direttamente sull'anteprima."
                   "  Click + trascina → rilascia per confermare.  Tasto destro = annulla.")
 
-    def _update_roi_label(self):
-        if app.roi:
-            x1, y1, x2, y2 = app.roi
-            self.roi_label.config(
-                text=f"({x1},{y1}) → ({x2},{y2})   {x2-x1}×{y2-y1} px",
-                fg="green")
+    def _update_area_listbox(self):
+        self.area_listbox.delete(0, tk.END)
+        if not app.rois:
+            self.area_listbox.insert(tk.END, "  (nessuna area definita)")
         else:
-            self.roi_label.config(text="Nessuna area  (cattura intero frame)", fg="gray")
+            for aid, (x1, y1, x2, y2, rotation) in sorted(app.rois.items()):
+                rot_str = f"  rot:{rotation}°" if rotation != 0 else ""
+                self.area_listbox.insert(
+                    tk.END,
+                    f"  Area {aid}:  ({x1},{y1})-({x2},{y2})  {x2-x1}x{y2-y1}px{rot_str}"
+                )
+
+    def _remove_selected_area(self):
+        sel = self.area_listbox.curselection()
+        if not sel:
+            self._log("[WARN] Seleziona un'area dalla lista per rimuoverla")
+            return
+        idx  = sel[0]
+        keys = sorted(app.rois.keys())
+        if idx < len(keys):
+            area_id = keys[idx]
+            del app.rois[area_id]
+            self._log(f"[INFO] Area {area_id} rimossa")
+            self._update_area_listbox()
+
+    def _clear_all_areas(self):
+        app.rois.clear()
+        self._log("[INFO] Tutte le aree rimosse")
+        self._update_area_listbox()
 
     # ─────────────────────────────────────────
     #  Mouse handlers per selezione su anteprima
@@ -733,28 +827,27 @@ class WebcamCaptureGUI:
 
         self._sel_current = (event.x, event.y)
         self._selecting_area = False
-        self.preview_panel.config(cursor="")   # ripristina cursore normale
+        self.preview_panel.config(cursor="")
 
-        # Converti in coordinate frame reale
         x1d, y1d = self._sel_start
         x2d, y2d = self._sel_current
         x1, y1 = self._display_to_frame(x1d, y1d)
         x2, y2 = self._display_to_frame(x2d, y2d)
 
-        # Normalizza (gestisce disegno in qualsiasi direzione)
         x1, x2 = min(x1, x2), max(x1, x2)
         y1, y2 = min(y1, y2), max(y1, y2)
 
         if x2 - x1 > 5 and y2 - y1 > 5:
-            app.roi = (x1, y1, x2, y2)
-            self._log(f"[OK] Area: ({x1},{y1}) - ({x2},{y2})  →  {x2-x1}×{y2-y1} px")
+            area_id  = self._next_area_id
+            rotation = int(self.rotation_var.get().replace("°", ""))
+            app.rois[area_id] = (x1, y1, x2, y2, rotation)
+            self._log(f"[OK] Area {area_id}: ({x1},{y1})-({x2},{y2})  {x2-x1}x{y2-y1}px  rot={rotation}°")
         else:
             self._log("[WARN] Area troppo piccola, ignorata")
 
-        # Resetta il tracciamento del rettangolo temporaneo
         self._sel_start   = None
         self._sel_current = None
-        self._update_roi_label()
+        self._update_area_listbox()
 
     def _clear_roi(self):
         app.roi = None
@@ -768,11 +861,18 @@ class WebcamCaptureGUI:
         filename = self.test_name_var.get().strip() or "test_capture.jpg"
         app.save_directory = self.dir_var.get().strip()
 
-        def _run():
-            response = _process_command(f"CAPTURE:{filename}", self._log)
-            self._log(f"[TEST] → {response}")
+        if not app.rois:
+            self._log("[WARN] Nessuna area definita. Prima aggiungi almeno un'area.")
+            return
 
-        # Esegui in un thread separato per non bloccare la GUI durante l'acquisizione
+        # Cattura tutte le aree definite aggiungendo il numero area al nome file
+        def _run():
+            base, ext = os.path.splitext(filename)
+            for aid in sorted(app.rois.keys()):
+                fname    = f"{base}_area{aid}{ext}"
+                response = _process_command(f"CAPTURE:{aid}:{fname}", self._log)
+                self._log(f"[TEST] Area {aid} → {response}")
+
         threading.Thread(target=_run, daemon=True).start()
 
     # ─────────────────────────────────────────
@@ -851,11 +951,11 @@ class WebcamCaptureGUI:
         if frame is not None:
             display = frame.copy()
 
-            # Disegna la ROI confermata sull'anteprima
-            if app.roi:
-                x1, y1, x2, y2 = app.roi
+            # Disegna tutte le aree confermate con il loro ID
+            for aid, (x1, y1, x2, y2, rotation) in app.rois.items():
                 cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(display, f"ROI {x2-x1}x{y2-y1}",
+                rot_str = f"  {rotation}deg" if rotation != 0 else ""
+                cv2.putText(display, f"Area {aid}{rot_str}  {x2-x1}x{y2-y1}",
                             (x1, max(y1 - 8, 15)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
