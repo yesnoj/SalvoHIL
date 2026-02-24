@@ -1,0 +1,939 @@
+"""
+webcam_capture_server.py
+========================
+Modulo di acquisizione immagini da webcam con GUI di configurazione e server socket.
+
+Il Live View può restare attivo mentre il server è in funzione.
+Un threading.Lock() garantisce che webcam e server non confliggano.
+
+PROTOCOLLO SOCKET (TCP localhost):
+-----------------------------------
+  Client → Server:  "CAPTURE:nome_immagine.jpg\n"
+  Server → Client:  "OK:percorso_completo\n"   oppure   "ERROR:messaggio\n"
+  Client → Server:  "STATUS\n"
+  Server → Client:  "READY\n"  oppure  "NOT_READY:motivo\n"
+"""
+
+import cv2
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
+import threading
+import socket
+import os
+import time
+
+
+# ─────────────────────────────────────────────
+#  Stato applicazione
+# ─────────────────────────────────────────────
+class AppState:
+    def __init__(self):
+        self.cap = None
+        self.webcam_initialized = False
+        self.selected_camera = 0
+        self.selected_resolution = "1920x1080"
+        self.resolution_options = ["640x480", "1280x720", "1920x1080"]
+
+        self.webcam_contrast   = 7
+        self.webcam_saturation = 60
+        self.webcam_exposure   = -8
+        self.webcam_focus      = 73
+
+        self.roi = None
+
+        self.server_running = False
+        self.server_socket  = None
+        self.server_port    = 5005
+        self.save_directory = os.path.dirname(os.path.abspath(__file__))
+
+        # ── LOCK: accesso esclusivo alla webcam (apertura/chiusura/parametri) ──
+        self.cam_lock = threading.Lock()
+
+        # ── Frame grabber thread ──────────────────────────────────────────────
+        # Un thread dedicato legge continuamente dalla webcam e salva
+        # sempre l'ultimo frame disponibile. Il Live View e il server
+        # leggono da qui senza dover aspettare cap.read().
+        self.latest_frame      = None       # ultimo frame BGR disponibile
+        self.frame_lock        = threading.Lock()   # protegge latest_frame
+        self.grabber_running   = False      # flag per fermare il thread
+
+        self.log_fn = print
+
+
+app = AppState()
+
+
+# ─────────────────────────────────────────────
+#  Webcam helpers
+# ─────────────────────────────────────────────
+def initialize_webcam():
+    """Apre e configura la webcam. Deve essere chiamata col lock acquisito."""
+    try:
+        if app.cap is not None and app.cap.isOpened():
+            app.cap.release()
+            app.cap = None
+
+        try:
+            app.cap = cv2.VideoCapture(app.selected_camera, cv2.CAP_DSHOW)
+        except Exception:
+            app.cap = cv2.VideoCapture(app.selected_camera)
+
+        if not app.cap.isOpened():
+            app.log_fn(f"[ERRORE] Impossibile aprire webcam {app.selected_camera}")
+            return False
+
+        width, height = map(int, app.selected_resolution.split('x'))
+        app.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        app.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        app.cap.set(cv2.CAP_PROP_FPS,          30)
+        app.cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        app.cap.set(cv2.CAP_PROP_AUTOFOCUS,    0)
+
+        _apply_webcam_params()
+
+        for _ in range(3):
+            app.cap.read()
+
+        actual_w = int(app.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(app.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        app.log_fn(f"[OK] Webcam aperta: {actual_w}x{actual_h}")
+        app.webcam_initialized = True
+
+        # Avvia il thread grabber se non è già in esecuzione
+        if not app.grabber_running:
+            threading.Thread(target=start_frame_grabber, daemon=True).start()
+
+        return True
+
+    except Exception as e:
+        app.log_fn(f"[ERRORE] Inizializzazione webcam: {e}")
+        return False
+
+
+def _apply_webcam_params():
+    if app.cap is None or not app.cap.isOpened():
+        return
+    app.cap.set(cv2.CAP_PROP_CONTRAST,   float(app.webcam_contrast))
+    app.cap.set(cv2.CAP_PROP_SATURATION, float(app.webcam_saturation))
+    app.cap.set(cv2.CAP_PROP_EXPOSURE,   float(app.webcam_exposure))
+    try:
+        app.cap.set(cv2.CAP_PROP_FOCUS, float(app.webcam_focus))
+    except Exception:
+        pass
+
+
+def release_webcam():
+    stop_frame_grabber()
+    time.sleep(0.15)   # lascia al grabber il tempo di uscire dal loop
+    with app.cam_lock:
+        if app.cap is not None and app.cap.isOpened():
+            app.cap.release()
+            app.cap = None
+        app.webcam_initialized = False
+    with app.frame_lock:
+        app.latest_frame = None
+
+
+def start_frame_grabber():
+    """
+    Thread dedicato che legge continuamente dalla webcam alla massima velocità
+    e salva sempre l'ultimo frame in app.latest_frame.
+    Il Live View e il server leggono da lì, senza mai bloccarsi su cap.read().
+    """
+    app.grabber_running = True
+    app.log_fn("[GRABBER] Thread acquisizione frame avviato")
+
+    while app.grabber_running:
+        with app.cam_lock:
+            if app.cap is None or not app.cap.isOpened():
+                # Webcam non disponibile: aspetta un po' e riprova
+                time.sleep(0.1)
+                continue
+            ret, frame = app.cap.read()
+
+        if ret and frame is not None:
+            with app.frame_lock:
+                app.latest_frame = frame
+        else:
+            time.sleep(0.01)   # piccola pausa se il frame non è disponibile
+
+    app.log_fn("[GRABBER] Thread acquisizione frame fermato")
+
+
+def stop_frame_grabber():
+    app.grabber_running = False
+
+
+def grab_color_frame():
+    """
+    Restituisce l'ultimo frame disponibile (già letto dal grabber thread).
+    Velocissimo: non blocca su cap.read(), non usa cam_lock.
+    """
+    with app.frame_lock:
+        if app.latest_frame is None:
+            return None
+        return app.latest_frame.copy()
+
+
+def grab_fresh_frame_for_capture():
+    """
+    Per il server: restituisce il frame più recente disponibile.
+    Il grabber thread lo tiene sempre aggiornato.
+    """
+    with app.frame_lock:
+        if app.latest_frame is None:
+            return None
+        return app.latest_frame.copy()
+
+
+def capture_roi(frame):
+    if app.roi is None:
+        return frame
+    x1, y1, x2, y2 = app.roi
+    h, w = frame.shape[:2]
+    x1, x2 = max(0, min(x1, w)), max(0, min(x2, w))
+    y1, y2 = max(0, min(y1, h)), max(0, min(y2, h))
+    if x2 <= x1 or y2 <= y1:
+        return frame
+    return frame[y1:y2, x1:x2]
+
+
+def save_image(frame, filepath):
+    try:
+        cv2.imwrite(filepath, frame)
+        return True
+    except Exception as e:
+        app.log_fn(f"[ERRORE] Salvataggio immagine: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────
+#  Server socket
+# ─────────────────────────────────────────────
+def start_socket_server(port, log_fn):
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', port))
+        srv.listen(5)
+        srv.settimeout(1.0)
+        app.server_socket = srv
+        app.server_running = True
+        log_fn(f"[SERVER] In ascolto su 127.0.0.1:{port}")
+
+        while app.server_running:
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(
+                target=_handle_client,
+                args=(conn, addr, log_fn),
+                daemon=True
+            ).start()
+
+    except Exception as e:
+        log_fn(f"[ERRORE SERVER] {e}")
+    finally:
+        try:
+            srv.close()
+        except Exception:
+            pass
+        app.server_running = False
+        log_fn("[SERVER] Fermato")
+
+
+def _handle_client(conn, addr, log_fn):
+    try:
+        conn.settimeout(10.0)
+        data = b""
+        while b"\n" not in data:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            data += chunk
+
+        command = data.decode(errors="replace").strip()
+        log_fn(f"[SERVER] Comando da {addr}: {command!r}")
+        response = _process_command(command, log_fn)
+        conn.sendall((response + "\n").encode())
+
+    except Exception as e:
+        log_fn(f"[SERVER] Errore client {addr}: {e}")
+        try:
+            conn.sendall(f"ERROR:{e}\n".encode())
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def _process_command(command, log_fn):
+    if command.strip().upper() == "STATUS":
+        if app.cap is None or not app.cap.isOpened():
+            return "NOT_READY:webcam non aperta"
+        if app.roi is None:
+            return "NOT_READY:area non selezionata"
+        return "READY"
+
+    if command.upper().startswith("CAPTURE:"):
+        filename = command[len("CAPTURE:"):].strip()
+        if not filename:
+            return "ERROR:nome file mancante"
+
+        if not os.path.isabs(filename):
+            filepath = os.path.join(app.save_directory, filename)
+        else:
+            filepath = filename
+
+        dirpath = os.path.dirname(filepath)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+
+        # Usa grab_fresh_frame_for_capture() → include il lock internamente
+        frame = grab_fresh_frame_for_capture()
+        if frame is None:
+            return "ERROR:impossibile acquisire frame dalla webcam"
+
+        roi_frame = capture_roi(frame)
+
+        if save_image(roi_frame, filepath):
+            log_fn(f"[SERVER] Immagine salvata: {filepath}")
+            return f"OK:{filepath}"
+        else:
+            return f"ERROR:salvataggio fallito → {filepath}"
+
+    return f"ERROR:comando non riconosciuto → {command!r}"
+
+
+# ─────────────────────────────────────────────
+#  Selezione area OpenCV
+# ─────────────────────────────────────────────
+_select_state = {"drawing": False, "start": None, "current": None, "done": False}
+
+
+def _mouse_select_area(event, x, y, flags, param):
+    s = _select_state
+    display = param["frame"].copy()
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        s["drawing"] = True
+        s["start"]   = (x, y)
+        s["current"] = (x, y)
+    elif event == cv2.EVENT_MOUSEMOVE and s["drawing"]:
+        s["current"] = (x, y)
+    elif event == cv2.EVENT_LBUTTONUP and s["drawing"]:
+        s["drawing"] = False
+        s["current"] = (x, y)
+        s["done"]    = True
+
+    if s["start"] and s["current"]:
+        x1, y1 = s["start"]
+        x2, y2 = s["current"]
+        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(display,
+                    f"ROI: ({min(x1,x2)},{min(y1,y2)}) - ({max(x1,x2)},{max(y1,y2)})",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    cv2.imshow("Seleziona Area - ENTER conferma | ESC annulla", display)
+
+
+def open_area_selection_window(log_fn):
+    # Prende un frame con il lock
+    with app.cam_lock:
+        if not (app.cap and app.cap.isOpened()):
+            if not initialize_webcam():
+                log_fn("[ERRORE] Webcam non disponibile per la selezione area")
+                return
+        ret, frame = app.cap.read()
+
+    if not ret or frame is None:
+        log_fn("[ERRORE] Impossibile acquisire frame per selezione area")
+        return
+
+    _select_state.update({"drawing": False, "start": None, "current": None, "done": False})
+
+    win_name = "Seleziona Area - ENTER conferma | ESC annulla"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 960, 540)
+    cv2.setMouseCallback(win_name, _mouse_select_area, {"frame": frame})
+    cv2.imshow(win_name, frame)
+
+    log_fn("[INFO] Disegna l'area con il mouse. ENTER = conferma, ESC = annulla")
+
+    while True:
+        key = cv2.waitKey(30) & 0xFF
+        if key == 13:  # ENTER
+            if _select_state["done"] and _select_state["start"] and _select_state["current"]:
+                x1, y1 = _select_state["start"]
+                x2, y2 = _select_state["current"]
+                x1, x2 = min(x1, x2), max(x1, x2)
+                y1, y2 = min(y1, y2), max(y1, y2)
+                if x2 > x1 and y2 > y1:
+                    app.roi = (x1, y1, x2, y2)
+                    log_fn(f"[OK] Area: ({x1},{y1}) - ({x2},{y2})  →  {x2-x1}x{y2-y1} px")
+                else:
+                    log_fn("[WARN] Area non valida, ignorata")
+            else:
+                log_fn("[WARN] Nessuna area disegnata")
+            break
+        elif key == 27:  # ESC
+            log_fn("[INFO] Selezione area annullata")
+            break
+
+    cv2.destroyWindow(win_name)
+
+
+# ─────────────────────────────────────────────
+#  ScrollableFrame
+# ─────────────────────────────────────────────
+class ScrollableFrame(tk.Frame):
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+
+        self.canvas    = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg="#f0f0f0")
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner   = tk.Frame(self.canvas, bg="#f0f0f0")
+        self._win_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        self.inner.bind("<Configure>",  self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Rotella del mouse attiva solo quando il cursore è sopra
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._on_mousewheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _on_inner_configure(self, event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self._win_id, width=event.width)
+
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+
+# ─────────────────────────────────────────────
+#  GUI principale
+# ─────────────────────────────────────────────
+class WebcamCaptureGUI:
+    def __init__(self, root_window):
+        self.root = root_window
+        self.root.title("Webcam Capture Server")
+
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        win_w = min(1150, sw - 40)
+        win_h = min(780,  sh - 60)
+        self.root.geometry(f"{win_w}x{win_h}")
+        self.root.minsize(850, 620)
+        self.root.resizable(True, True)
+
+        self._live_running   = False
+
+        # Stato selezione area direttamente sull'anteprima
+        self._selecting_area = False   # True quando l'utente sta disegnando
+        self._sel_start      = None    # (x, y) in coordinate display
+        self._sel_current    = None    # (x, y) in coordinate display
+        # Parametri di scala usati nell'ultimo frame visualizzato
+        # servono per convertire coordinate display → coordinate frame reale
+        self._disp_scale     = 1.0
+        self._disp_x_off     = 0
+        self._disp_y_off     = 0
+
+        self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ─────────────────────────────────────────
+    #  Costruzione UI
+    # ─────────────────────────────────────────
+    def _build_ui(self):
+        main = tk.Frame(self.root)
+        main.pack(fill="both", expand=True, padx=6, pady=6)
+
+        left_container = tk.Frame(main, width=310)
+        left_container.pack(side="left", fill="y", padx=(0, 6))
+        left_container.pack_propagate(False)
+
+        self.scroll_frame = ScrollableFrame(left_container)
+        self.scroll_frame.pack(fill="both", expand=True)
+        left = self.scroll_frame.inner
+
+        right = tk.Frame(main)
+        right.pack(side="left", fill="both", expand=True)
+
+        self._build_left(left)
+        self._build_right(right)
+
+    def _build_left(self, p):
+        opt = {"fill": "x", "pady": 4, "padx": 4}
+
+        # ── Webcam ──────────────────────────────
+        frm = tk.LabelFrame(p, text="Webcam", font=("Arial", 9, "bold"))
+        frm.pack(**opt)
+
+        tk.Label(frm, text="Camera Index:", font=("Arial", 8)).pack(anchor="w", padx=5, pady=(4, 0))
+        self.cam_var = tk.StringVar(value="Webcam 0")
+        cb = ttk.Combobox(frm, textvariable=self.cam_var,
+                          values=["Webcam 0", "Webcam 1", "Webcam 2"],
+                          state="readonly", width=18)
+        cb.pack(fill="x", padx=5, pady=2)
+        cb.bind("<<ComboboxSelected>>", self._on_camera_change)
+
+        tk.Label(frm, text="Risoluzione:", font=("Arial", 8)).pack(anchor="w", padx=5)
+        self.res_var = tk.StringVar(value=app.selected_resolution)
+        rb = ttk.Combobox(frm, textvariable=self.res_var,
+                          values=app.resolution_options,
+                          state="readonly", width=18)
+        rb.pack(fill="x", padx=5, pady=(2, 5))
+        rb.bind("<<ComboboxSelected>>", self._on_resolution_change)
+
+        # ── Parametri Webcam ─────────────────────
+        frm2 = tk.LabelFrame(p, text="Parametri Webcam", font=("Arial", 9, "bold"))
+        frm2.pack(**opt)
+
+        self.contrast_sl   = self._slider(frm2, "Contrasto",   0,   10,  app.webcam_contrast,   self._on_contrast)
+        self.saturation_sl = self._slider(frm2, "Saturazione", 0,   200, app.webcam_saturation, self._on_saturation)
+        self.exposure_sl   = self._slider(frm2, "Esposizione", -13, 0,   app.webcam_exposure,   self._on_exposure)
+        self.focus_sl      = self._slider(frm2, "Focus",       0,   255, app.webcam_focus,      self._on_focus)
+
+        # ── Live View ────────────────────────────
+        frm3 = tk.LabelFrame(p, text="Live View", font=("Arial", 9, "bold"))
+        frm3.pack(**opt)
+
+        # Indicatore stato Live View
+        self.live_status = tk.Label(frm3, text="● Inattivo", fg="gray",
+                                    font=("Arial", 8, "bold"))
+        self.live_status.pack(anchor="w", padx=5, pady=(4, 0))
+
+        self.live_btn = tk.Button(frm3, text="▶  Start Live View",
+                                  command=self._toggle_live_view,
+                                  bg="#8cff8c", font=("Arial", 10, "bold"), height=2)
+        self.live_btn.pack(fill="x", padx=5, pady=5)
+
+        # ── Area di Acquisizione ─────────────────
+        frm4 = tk.LabelFrame(p, text="Area di Acquisizione", font=("Arial", 9, "bold"))
+        frm4.pack(**opt)
+
+        self.roi_label = tk.Label(frm4, text="Nessuna area selezionata",
+                                  font=("Arial", 8), fg="red")
+        self.roi_label.pack(fill="x", padx=5, pady=2)
+
+        tk.Button(frm4, text="✏  Seleziona Area sull'anteprima",
+                  command=self._select_area,
+                  bg="#ffd080", font=("Arial", 9, "bold"), height=2
+                  ).pack(fill="x", padx=5, pady=3)
+
+        tk.Button(frm4, text="Rimuovi Area  (usa intero frame)",
+                  command=self._clear_roi,
+                  font=("Arial", 8)
+                  ).pack(fill="x", padx=5, pady=(0, 4))
+
+        # ── Directory Salvataggio ────────────────
+        frm5 = tk.LabelFrame(p, text="Directory Salvataggio", font=("Arial", 9, "bold"))
+        frm5.pack(**opt)
+
+        self.dir_var = tk.StringVar(value=app.save_directory)
+        e = tk.Entry(frm5, textvariable=self.dir_var, font=("Arial", 8))
+        e.pack(fill="x", padx=5, pady=4)
+        e.bind("<FocusOut>", lambda ev: setattr(app, "save_directory", self.dir_var.get()))
+
+        # ── Server Socket ─────────────────────────
+        frm6 = tk.LabelFrame(p, text="Server Socket", font=("Arial", 9, "bold"))
+        frm6.pack(**opt)
+
+        pr = tk.Frame(frm6)
+        pr.pack(fill="x", padx=5, pady=4)
+        tk.Label(pr, text="Porta:", font=("Arial", 8)).pack(side="left")
+        self.port_var = tk.StringVar(value=str(app.server_port))
+        tk.Entry(pr, textvariable=self.port_var, width=8,
+                 font=("Arial", 8)).pack(side="left", padx=6)
+
+        self.server_btn = tk.Button(frm6, text="▶  Start Server",
+                                    command=self._toggle_server,
+                                    bg="#8cff8c", font=("Arial", 10, "bold"), height=2)
+        self.server_btn.pack(fill="x", padx=5, pady=4)
+
+        self.server_status = tk.Label(frm6, text="● Offline",
+                                      fg="red", font=("Arial", 9, "bold"))
+        self.server_status.pack(padx=5, pady=(0, 5))
+
+        # ── Test Acquisizione ────────────────────
+        frm7 = tk.LabelFrame(p, text="Test Acquisizione", font=("Arial", 9, "bold"))
+        frm7.pack(**opt)
+
+        tk.Label(frm7, text="Nome file da salvare:", font=("Arial", 8)).pack(anchor="w", padx=5, pady=(4, 0))
+        self.test_name_var = tk.StringVar(value="test_capture.jpg")
+        tk.Entry(frm7, textvariable=self.test_name_var,
+                 font=("Arial", 8)).pack(fill="x", padx=5, pady=2)
+
+        tk.Button(frm7, text="📷  Cattura ora",
+                  command=self._test_capture,
+                  bg="#80ccff", font=("Arial", 10, "bold"), height=2
+                  ).pack(fill="x", padx=5, pady=5)
+
+        tk.Label(p, text="", height=2).pack()  # spazio extra per scroll
+
+    def _build_right(self, parent):
+        pf = tk.LabelFrame(parent, text="Anteprima Webcam", font=("Arial", 9, "bold"))
+        pf.pack(fill="both", expand=True, pady=(0, 4))
+
+        self.preview_panel = tk.Label(pf, bg="black",
+                                      text="Live View non attiva",
+                                      fg="white", font=("Arial", 12))
+        self.preview_panel.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Binding mouse per selezione area direttamente sull'anteprima
+        self.preview_panel.bind("<ButtonPress-1>",   self._on_preview_press)
+        self.preview_panel.bind("<B1-Motion>",        self._on_preview_drag)
+        self.preview_panel.bind("<ButtonRelease-1>", self._on_preview_release)
+
+        lf = tk.LabelFrame(parent, text="Log", font=("Arial", 9, "bold"))
+        lf.pack(fill="x", pady=(0, 4))
+
+        li = tk.Frame(lf)
+        li.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.log_text = tk.Text(li, height=9, font=("Courier", 8), bg="#f5f5f5")
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+        sb = tk.Scrollbar(li, command=self.log_text.yview)
+        sb.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=sb.set)
+
+        app.log_fn = self._log
+
+    # ─────────────────────────────────────────
+    #  Slider helper
+    # ─────────────────────────────────────────
+    def _slider(self, parent, label, from_, to, init, cmd):
+        sl = tk.Scale(parent, from_=from_, to=to, orient="horizontal",
+                      label=label, command=cmd, font=("Arial", 8), length=260)
+        sl.set(init)
+        sl.pack(fill="x", padx=5, pady=2)
+        return sl
+
+    # ─────────────────────────────────────────
+    #  Log
+    # ─────────────────────────────────────────
+    def _log(self, msg):
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+        try:
+            self.root.after(0, self._log_insert, line)
+        except Exception:
+            pass
+
+    def _log_insert(self, line):
+        self.log_text.insert("end", line)
+        self.log_text.see("end")
+        n = int(self.log_text.index("end-1c").split(".")[0])
+        if n > 500:
+            self.log_text.delete("1.0", f"{n-500}.0")
+
+    # ─────────────────────────────────────────
+    #  Callback slider webcam
+    # ─────────────────────────────────────────
+    def _on_contrast(self, v):
+        app.webcam_contrast = int(float(v))
+        with app.cam_lock:
+            if app.cap and app.cap.isOpened():
+                app.cap.set(cv2.CAP_PROP_CONTRAST, app.webcam_contrast)
+
+    def _on_saturation(self, v):
+        app.webcam_saturation = int(float(v))
+        with app.cam_lock:
+            if app.cap and app.cap.isOpened():
+                app.cap.set(cv2.CAP_PROP_SATURATION, app.webcam_saturation)
+
+    def _on_exposure(self, v):
+        app.webcam_exposure = int(float(v))
+        with app.cam_lock:
+            if app.cap and app.cap.isOpened():
+                app.cap.set(cv2.CAP_PROP_EXPOSURE, app.webcam_exposure)
+
+    def _on_focus(self, v):
+        app.webcam_focus = int(float(v))
+        with app.cam_lock:
+            if app.cap and app.cap.isOpened():
+                try:
+                    app.cap.set(cv2.CAP_PROP_FOCUS, app.webcam_focus)
+                except Exception:
+                    pass
+
+    def _on_camera_change(self, event):
+        app.selected_camera = int(self.cam_var.get().split()[-1])
+        release_webcam()
+        self._log(f"Camera cambiata → {self.cam_var.get()}")
+
+    def _on_resolution_change(self, event):
+        app.selected_resolution = self.res_var.get()
+        release_webcam()
+        self._log(f"Risoluzione cambiata → {app.selected_resolution}")
+
+    # ─────────────────────────────────────────
+    #  Selezione area
+    # ─────────────────────────────────────────
+    def _select_area(self):
+        # Assicurati che la webcam sia aperta e il Live View attivo
+        if not (app.cap and app.cap.isOpened()):
+            if not initialize_webcam():
+                self._log("[ERRORE] Webcam non disponibile")
+                return
+
+        if not self._live_running:
+            # Avvia automaticamente il Live View se non è attivo
+            self._toggle_live_view()
+
+        # Attiva la modalità selezione
+        self._selecting_area = True
+        self._sel_start      = None
+        self._sel_current    = None
+
+        # Cambia il cursore per indicare la modalità disegno
+        self.preview_panel.config(cursor="crosshair")
+
+        self._log("[INFO] Disegna l'area direttamente sull'anteprima."
+                  "  Click + trascina → rilascia per confermare.  Tasto destro = annulla.")
+
+    def _update_roi_label(self):
+        if app.roi:
+            x1, y1, x2, y2 = app.roi
+            self.roi_label.config(
+                text=f"({x1},{y1}) → ({x2},{y2})   {x2-x1}×{y2-y1} px",
+                fg="green")
+        else:
+            self.roi_label.config(text="Nessuna area  (cattura intero frame)", fg="gray")
+
+    # ─────────────────────────────────────────
+    #  Mouse handlers per selezione su anteprima
+    # ─────────────────────────────────────────
+    def _display_to_frame(self, dx, dy):
+        """Converte coordinate del pannello display → coordinate frame reale."""
+        fx = (dx - self._disp_x_off) / self._disp_scale
+        fy = (dy - self._disp_y_off) / self._disp_scale
+        return int(fx), int(fy)
+
+    def _on_preview_press(self, event):
+        if not self._selecting_area:
+            return
+        self._sel_start   = (event.x, event.y)
+        self._sel_current = (event.x, event.y)
+
+    def _on_preview_drag(self, event):
+        if not self._selecting_area or self._sel_start is None:
+            return
+        self._sel_current = (event.x, event.y)
+
+    def _on_preview_release(self, event):
+        if not self._selecting_area or self._sel_start is None:
+            return
+
+        self._sel_current = (event.x, event.y)
+        self._selecting_area = False
+        self.preview_panel.config(cursor="")   # ripristina cursore normale
+
+        # Converti in coordinate frame reale
+        x1d, y1d = self._sel_start
+        x2d, y2d = self._sel_current
+        x1, y1 = self._display_to_frame(x1d, y1d)
+        x2, y2 = self._display_to_frame(x2d, y2d)
+
+        # Normalizza (gestisce disegno in qualsiasi direzione)
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+
+        if x2 - x1 > 5 and y2 - y1 > 5:
+            app.roi = (x1, y1, x2, y2)
+            self._log(f"[OK] Area: ({x1},{y1}) - ({x2},{y2})  →  {x2-x1}×{y2-y1} px")
+        else:
+            self._log("[WARN] Area troppo piccola, ignorata")
+
+        # Resetta il tracciamento del rettangolo temporaneo
+        self._sel_start   = None
+        self._sel_current = None
+        self._update_roi_label()
+
+    def _clear_roi(self):
+        app.roi = None
+        self._update_roi_label()
+        self._log("[INFO] Area rimossa: verrà catturato l'intero frame")
+
+    # ─────────────────────────────────────────
+    #  Test acquisizione
+    # ─────────────────────────────────────────
+    def _test_capture(self):
+        filename = self.test_name_var.get().strip() or "test_capture.jpg"
+        app.save_directory = self.dir_var.get().strip()
+
+        def _run():
+            response = _process_command(f"CAPTURE:{filename}", self._log)
+            self._log(f"[TEST] → {response}")
+
+        # Esegui in un thread separato per non bloccare la GUI durante l'acquisizione
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ─────────────────────────────────────────
+    #  Server
+    # ─────────────────────────────────────────
+    def _toggle_server(self):
+        if app.server_running:
+            app.server_running = False
+            if app.server_socket:
+                try:
+                    app.server_socket.close()
+                except Exception:
+                    pass
+            self.server_btn.config(text="▶  Start Server", bg="#8cff8c")
+            self.server_status.config(text="● Offline", fg="red")
+            self._log("[SERVER] Fermato dall'utente")
+        else:
+            try:
+                port = int(self.port_var.get())
+            except ValueError:
+                self._log("[ERRORE] Porta non valida")
+                return
+
+            app.server_port    = port
+            app.save_directory = self.dir_var.get().strip()
+
+            if not (app.cap and app.cap.isOpened()):
+                if not initialize_webcam():
+                    self._log("[ERRORE] Webcam non disponibile, server non avviato")
+                    return
+
+            threading.Thread(
+                target=start_socket_server,
+                args=(port, self._log),
+                daemon=True
+            ).start()
+
+            self.root.after(600, self._check_server_started)
+
+    def _check_server_started(self):
+        if app.server_running:
+            self.server_btn.config(text="■  Stop Server", bg="#ff8c8c")
+            self.server_status.config(
+                text=f"● Online  (porta {app.server_port})", fg="green")
+        else:
+            self._log("[ERRORE] Server non avviato (porta già occupata?)")
+
+    # ─────────────────────────────────────────
+    #  Live View  (compatibile con server attivo)
+    # ─────────────────────────────────────────
+    def _toggle_live_view(self):
+        if self._live_running:
+            self._live_running = False
+            self.live_btn.config(text="▶  Start Live View", bg="#8cff8c")
+            self.live_status.config(text="● Inattivo", fg="gray")
+        else:
+            if not (app.cap and app.cap.isOpened()):
+                if not initialize_webcam():
+                    self._log("[ERRORE] Webcam non disponibile")
+                    return
+            self._live_running = True
+            self.live_btn.config(text="■  Stop Live View", bg="#ff8c8c")
+            self.live_status.config(text="● Attivo", fg="green")
+            self._live_loop()
+
+    def _live_loop(self):
+        """
+        Loop Live View: usa grab_color_frame() che include il cam_lock.
+        Se il server sta acquisendo in quel momento, aspetta il suo turno
+        (qualche millisecondo) e poi aggiorna la preview normalmente.
+        """
+        if not self._live_running:
+            return
+
+        frame = grab_color_frame()   # thread-safe grazie al cam_lock
+        if frame is not None:
+            display = frame.copy()
+
+            # Disegna la ROI confermata sull'anteprima
+            if app.roi:
+                x1, y1, x2, y2 = app.roi
+                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(display, f"ROI {x2-x1}x{y2-y1}",
+                            (x1, max(y1 - 8, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            # Indicatore server attivo nell'anteprima
+            if app.server_running:
+                cv2.putText(display, "[SERVER ONLINE]",
+                            (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 200, 0), 2)
+
+            # Scala per adattarsi al pannello
+            pw = max(self.preview_panel.winfo_width(),  300)
+            ph = max(self.preview_panel.winfo_height(), 200)
+            h, w  = display.shape[:2]
+            scale = min(pw / w, ph / h)
+            nw, nh = int(w * scale), int(h * scale)
+
+            # Calcola offset di centratura (Tkinter Label centra l'immagine)
+            x_off = (pw - nw) // 2
+            y_off = (ph - nh) // 2
+
+            # Salva i parametri di scala per la conversione coordinate mouse
+            self._disp_scale = scale
+            self._disp_x_off = x_off
+            self._disp_y_off = y_off
+
+            if nw > 0 and nh > 0:
+                small = cv2.resize(display, (nw, nh), interpolation=cv2.INTER_AREA)
+
+                # Disegna il rettangolo di selezione in corso (se l'utente sta disegnando)
+                if self._selecting_area and self._sel_start and self._sel_current:
+                    x1d, y1d = self._sel_start
+                    x2d, y2d = self._sel_current
+                    # Converti da coordinate pannello a coordinate small (sottraiamo l'offset)
+                    rx1 = x1d - x_off
+                    ry1 = y1d - y_off
+                    rx2 = x2d - x_off
+                    ry2 = y2d - y_off
+                    cv2.rectangle(small, (rx1, ry1), (rx2, ry2), (0, 200, 255), 2)
+                    cv2.putText(small, "Rilascia per confermare",
+                                (min(rx1, rx2), max(min(ry1, ry2) - 8, 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+
+                imgtk = ImageTk.PhotoImage(
+                    image=Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
+                self.preview_panel.imgtk = imgtk
+                self.preview_panel.configure(image=imgtk, text="")
+
+        self.root.after(50, self._live_loop)   # ~20 fps
+
+    # ─────────────────────────────────────────
+    #  Chiusura
+    # ─────────────────────────────────────────
+    def _on_close(self):
+        self._live_running = False
+        app.server_running = False
+        if app.server_socket:
+            try:
+                app.server_socket.close()
+            except Exception:
+                pass
+        release_webcam()
+        cv2.destroyAllWindows()
+        self.root.destroy()
+
+
+# ─────────────────────────────────────────────
+#  Entrypoint
+# ─────────────────────────────────────────────
+def main():
+    root = tk.Tk()
+    WebcamCaptureGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
