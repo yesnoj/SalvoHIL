@@ -1,15 +1,16 @@
 # Webcam Capture Server
 
 Sistema di acquisizione immagini da webcam con GUI di configurazione e server socket TCP.
-Permette a qualsiasi script Python esterno di richiedere la cattura di una o più aree dell'immagine con una singola riga di codice.
+Permette a qualsiasi script Python esterno di catturare una o più aree dell'immagine con una singola riga di codice.
 
 ---
 
 ## Struttura del progetto
 
 ```
-webcam_capture_server.py     # Server principale con GUI
-capture_client_example.py    # Esempio di client con tutti i casi d'uso
+webcam_capture_server.py   # Server principale con GUI
+webcam_client.py           # Modulo client da importare nel tuo codice
+esempio_utilizzo.py        # Esempi pratici di utilizzo
 ```
 
 ---
@@ -25,7 +26,9 @@ pip install opencv-python Pillow
 
 ---
 
-## Avvio
+## Avvio rapido
+
+### 1 — Avvia il server
 
 ```bash
 python webcam_capture_server.py
@@ -34,10 +37,6 @@ python webcam_capture_server.py
 L'applicazione si apre automaticamente **a schermo intero**.
 
 > Su Linux/Mac, se lo schermo intero non funziona, sostituire `self.root.state("zoomed")` con `self.root.attributes("-zoomed", True)` nel sorgente.
-
----
-
-## Configurazione guidata
 
 Segui questo ordine nella GUI:
 
@@ -50,22 +49,33 @@ Segui questo ordine nella GUI:
 7. Clicca **▶ Start Server** → lo stato diventa `● Online (porta 5005)`
 8. Testa con il bottone **📷 Cattura ora** prima di usare il client
 
+### 2 — Importa nel tuo codice
+
+Copia `webcam_client.py` nella cartella del tuo progetto, poi:
+
+```python
+from webcam_client import cattura
+
+percorso = cattura(area_id=1, nome_file="misura.jpg")
+```
+
+Niente altro. Il file salvato si trova nel percorso restituito.
+
 ---
 
 ## Aree di acquisizione
 
-È possibile definire un numero illimitato di aree indipendenti, ognuna con il proprio ID numerico e rotazione.
+È possibile definire un numero illimitato di aree indipendenti, ognuna con il proprio **ID numerico** e **rotazione**.
 
 ### Come aggiungere un'area
 
-1. Scegli la **Rotazione** dal menu (`0°` / `90°` / `180°` / `270°`) — verrà applicata al momento del salvataggio
+1. Scegli la **Rotazione** dal menu (`0°` / `90°` / `180°` / `270°`) — verrà applicata al salvataggio
 2. Clicca **✏ Aggiungi Area**
 3. Il cursore diventa una **croce** sull'anteprima
 4. **Trascina** per disegnare il rettangolo → rettangolo blu in tempo reale
 5. **Rilascia** per confermare → il rettangolo diventa verde con il numero area
 
-L'ID viene assegnato automaticamente in sequenza (1, 2, 3...).  
-Ogni area mostra sull'anteprima: `Area 1  90deg  320x240`
+L'ID viene assegnato automaticamente in sequenza (1, 2, 3...).
 
 ### Gestione aree
 
@@ -74,126 +84,105 @@ Ogni area mostra sull'anteprima: `Area 1  90deg  320x240`
 | Aggiungere | ✏ Aggiungi Area + disegna sull'anteprima |
 | Rimuovere una | Seleziona dalla lista → 🗑 Rimuovi |
 | Rimuovere tutte | Rimuovi tutte le aree |
-| Rotazione | Scelta prima di aggiungere l'area (per area) |
+| Rotazione | Scelta prima di aggiungere (per area, indipendente) |
+
+---
+
+## Utilizzo di `webcam_client.py`
+
+### `cattura(area_id, nome_file, porta=5005)`
+
+Cattura l'area specificata e salva il file.
+
+```python
+from webcam_client import cattura
+
+# Solo nome file → salvato nella directory configurata nel server
+percorso = cattura(1, "misura.jpg")
+
+# Percorso assoluto → salvato esattamente lì
+percorso = cattura(2, "C:/Risultati/misura.png")
+
+# Sottocartella relativa alla directory del server
+percorso = cattura(3, "sessione_A/misura.jpg")
+```
+
+**Parametri:**
+
+| Parametro | Tipo | Descrizione |
+|---|---|---|
+| `area_id` | int | ID dell'area (come configurato nella GUI) |
+| `nome_file` | str | Nome file o percorso. Il formato dipende dall'estensione (`.jpg`, `.png`, `.bmp`, `.tiff`) |
+| `porta` | int | Porta TCP del server (default: `5005`) |
+
+**Ritorna:** `str` — percorso completo del file salvato
+
+**Eccezioni:**
+- `RuntimeError` — il server ha risposto con errore (area inesistente, webcam offline...)
+- `ConnectionRefusedError` — il server non è in ascolto
+- `TimeoutError` — nessuna risposta entro 10 secondi
+
+---
+
+### `stato_server(porta=5005)`
+
+Verifica se il server è raggiungibile e pronto.
+
+```python
+from webcam_client import stato_server
+
+pronto, msg = stato_server()
+if pronto:
+    print(msg)   # es. "READY:aree=[1, 2, 3]"
+else:
+    print(f"Non disponibile: {msg}")
+```
+
+---
+
+### Esempi completi
+
+Vedi `esempio_utilizzo.py` per tutti i casi d'uso, oppure eseguilo direttamente:
+
+```bash
+python esempio_utilizzo.py
+```
 
 ---
 
 ## Protocollo socket
 
-Comunicazione via **TCP su localhost**, porta `5005` (configurabile dalla GUI).  
+La comunicazione avviene via **TCP su localhost**, porta `5005`.  
 Comandi in testo terminati da `\n`.
 
 | Comando | Risposta successo | Risposta errore |
 |---|---|---|
-| `CAPTURE:area_id:nome_file.jpg\n` | `OK:/percorso/completo/file.jpg\n` | `ERROR:messaggio\n` |
-| `STATUS\n` | `READY:aree=[1, 2, 3]\n` | `NOT_READY:motivo\n` |
-
-### Formati immagine supportati
-
-Il formato è determinato dall'estensione del nome file:
-
-| Estensione | Formato |
-|---|---|
-| `.jpg` / `.jpeg` | JPEG compresso |
-| `.png` | PNG lossless |
-| `.bmp` | Bitmap |
-| `.tiff` | TIFF |
-
----
-
-## Integrazione nel tuo codice Python
-
-### Funzione minima da copiare
-
-```python
-import socket
-
-def cattura(area_id, nome_file, porta=5005):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(10)
-        s.connect(('127.0.0.1', porta))
-        s.sendall(f'CAPTURE:{area_id}:{nome_file}\n'.encode())
-        risposta = s.recv(1024).decode().strip()
-    if risposta.startswith('OK:'):
-        return risposta[3:]   # percorso completo del file salvato
-    raise RuntimeError(f"Errore dal server: {risposta}")
-```
-
-### Esempi di utilizzo
-
-```python
-# Cattura area 1 → salvata nella directory configurata nella GUI
-percorso = cattura(1, 'misura.jpg')
-
-# Cattura area 2 → salvata in percorso assoluto
-percorso = cattura(2, 'C:/Risultati/misura.png')
-
-# Cattura area 3 → in sottocartella relativa alla dir del server
-percorso = cattura(3, 'sessione_A/misura.jpg')
-
-# Cattura più aree in sequenza
-import time
-timestamp = time.strftime("%Y%m%d_%H%M%S")
-for area_id in [1, 2, 3]:
-    cattura(area_id, f'area{area_id}_{timestamp}.jpg')
-```
-
-### Verifica stato server prima di catturare
-
-```python
-import socket
-
-def stato_server(porta=5005):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(3)
-            s.connect(('127.0.0.1', porta))
-            s.sendall(b'STATUS\n')
-            risposta = s.recv(1024).decode().strip()
-        return risposta.startswith('READY'), risposta
-    except Exception as e:
-        return False, str(e)
-
-pronto, msg = stato_server()
-if pronto:
-    print(f"Server pronto, {msg}")   # es. READY:aree=[1, 2, 3]
-else:
-    print(f"Server non disponibile: {msg}")
-```
+| `CAPTURE:area_id:nome_file\n` | `OK:/percorso/completo\n` | `ERROR:messaggio\n` |
+| `STATUS\n` | `READY:aree=[1, 2]\n` | `NOT_READY:motivo\n` |
 
 ---
 
 ## Architettura interna
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                  webcam_capture_server.py                   │
-│                                                             │
-│  [Grabber Thread]  cap.read() continuo → latest_frame      │
-│                              ↓                              │
-│  [GUI Thread]      Live View legge latest_frame  (~20fps)  │
-│                    Selezione aree via mouse sull'anteprima  │
-│                              ↓                              │
-│  [Server Thread]   Ascolta su TCP 127.0.0.1:5005           │
-│                    CAPTURE:id:file → latest_frame           │
-│                             → crop ROI → rotazione → salva │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  webcam_capture_server.py                    │
+│                                                              │
+│  [Grabber Thread]  cap.read() continuo → latest_frame       │
+│                              ↓                               │
+│  [GUI Thread]      Live View ~20fps, selezione aree mouse   │
+│                              ↓                               │
+│  [Server Thread]   TCP 127.0.0.1:5005                       │
+│                    CAPTURE:id:file → crop → rotazione → salva│
+└──────────────────────────────────────────────────────────────┘
                     ↑ TCP localhost
-┌─────────────────────────────────────────────────────────────┐
-│         capture_client_example.py  (o tuo script)          │
-│         cattura(area_id=1, nome_file='misura.jpg')         │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  webcam_client.py                                            │
+│  cattura(area_id, nome_file)  ←── importato dal tuo codice  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Thread e thread-safety
-
-| Thread | Ruolo |
-|---|---|
-| **Grabber** | Legge continuamente da `cap.read()`, aggiorna `latest_frame` via `frame_lock` |
-| **GUI (Tkinter)** | Live view a ~20fps, gestione slider e selezione aree via mouse |
-| **Server** | Ascolta su socket TCP; ogni richiesta viene gestita in un sotto-thread |
-
-I lock `cam_lock` (accesso webcam) e `frame_lock` (lettura/scrittura `latest_frame`) garantiscono l'assenza di race condition. Live View e Server possono girare contemporaneamente senza conflitti.
+I lock `cam_lock` e `frame_lock` garantiscono thread-safety tra Grabber, GUI e Server.
 
 ---
 
@@ -205,18 +194,17 @@ Tutti regolabili in tempo reale dagli slider senza riavviare:
 |---|---|---|
 | Contrasto | 0 – 10 | |
 | Saturazione | 0 – 200 | |
-| Esposizione | -13 – 0 | Valori negativi = esposizione manuale |
+| Esposizione | -13 – 0 | Valori negativi = manuale |
 | Focus | 0 – 255 | Autofocus disabilitato all'avvio |
 
 ---
 
 ## Note operative
 
-- Il server accetta connessioni **solo da localhost** per sicurezza. Per connessioni di rete modificare `'127.0.0.1'` in `'0.0.0.0'` in `start_socket_server`.
-- La **rotazione** è configurata per area nella GUI e viene applicata automaticamente al momento del salvataggio — il client non deve fare nulla di speciale.
-- Su alcune webcam focus ed esposizione manuale potrebbero non essere supportati dal driver — vengono ignorati silenziosamente.
+- Il server accetta connessioni solo da **localhost** per sicurezza. Per connessioni di rete modificare `'127.0.0.1'` in `'0.0.0.0'` in `start_socket_server`.
+- La **rotazione** è configurata per area nella GUI e applicata automaticamente al salvataggio — il client non deve fare nulla di speciale.
+- Le **sottocartelle** nel percorso file vengono create automaticamente.
 - OpenCV usa **DirectShow** (`cv2.CAP_DSHOW`) su Windows per evitare ritardi di inizializzazione.
-- Le sottocartelle nel percorso file vengono create automaticamente se non esistono.
 
 ---
 
