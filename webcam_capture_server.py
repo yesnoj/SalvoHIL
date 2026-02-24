@@ -250,8 +250,8 @@ def apply_perspective_correction(frame):
 def compute_perspective_matrix():
     """
     Calcola la matrice di trasformazione prospettica dai 4 punti selezionati.
-    I punti devono essere in ordine: top-left, top-right, bottom-right, bottom-left.
-    La dimensione di output viene calcolata automaticamente dalla media dei lati.
+    Ordine punti (senso orario): TL, TR, BR, BL.
+    La dimensione di output viene calcolata automaticamente dalla geometria dei 4 punti.
     """
     if len(app.perspective_points) != 4:
         return False
@@ -259,26 +259,31 @@ def compute_perspective_matrix():
         import numpy as np
         pts = np.float32(app.perspective_points)
 
-        # Calcola dimensione output automaticamente dalla geometria dei 4 punti
+        # Ordine punti: TL, TR, BR, BL  (senso orario)
         tl, tr, br, bl = pts
-        w1 = np.linalg.norm(br - bl)
-        w2 = np.linalg.norm(tr - tl)
-        h1 = np.linalg.norm(tr - br)
-        h2 = np.linalg.norm(tl - bl)
-        dst_w = int(max(w1, w2))
-        dst_h = int(max(h1, h2))
+
+        # Larghezza output = media delle due larghezze (top e bottom)
+        w_top    = np.linalg.norm(tr - tl)
+        w_bot    = np.linalg.norm(br - bl)
+        dst_w    = int(max(w_top, w_bot))
+
+        # Altezza output = media delle due altezze (left e right)
+        h_left   = np.linalg.norm(bl - tl)
+        h_right  = np.linalg.norm(br - tr)
+        dst_h    = int(max(h_left, h_right))
 
         if dst_w <= 0 or dst_h <= 0:
             return False
 
+        src_pts = np.float32([tl, tr, br, bl])
         dst_pts = np.float32([
-            [0,         0        ],
-            [dst_w - 1, 0        ],
-            [dst_w - 1, dst_h - 1],
-            [0,         dst_h - 1]
+            [0,         0        ],   # TL
+            [dst_w - 1, 0        ],   # TR
+            [dst_w - 1, dst_h - 1],   # BR
+            [0,         dst_h - 1]    # BL
         ])
 
-        app.perspective_matrix = cv2.getPerspectiveTransform(pts, dst_pts)
+        app.perspective_matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
         app.perspective_dst_w  = dst_w
         app.perspective_dst_h  = dst_h
         app.log_fn(f"[OK] Matrice prospettica calcolata → output: {dst_w}x{dst_h}px")
@@ -609,25 +614,50 @@ class WebcamCaptureGUI:
         frm3 = tk.LabelFrame(p, text="Live View", font=("Arial", 9, "bold"))
         frm3.pack(**opt)
 
-        # Indicatore stato Live View
         self.live_status = tk.Label(frm3, text="● Inattivo", fg="gray",
                                     font=("Arial", 8, "bold"))
-        self.live_status.pack(anchor="w", padx=5, pady=(4, 0))
+        self.live_status.pack(anchor="w", padx=5, pady=(3, 0))
 
         self.live_btn = tk.Button(frm3, text="▶  Start Live View",
                                   command=self._toggle_live_view,
-                                  bg="#8cff8c", font=("Arial", 10, "bold"), height=2)
-        self.live_btn.pack(fill="x", padx=5, pady=5)
+                                  bg="#8cff8c", font=("Arial", 9, "bold"), height=1)
+        self.live_btn.pack(fill="x", padx=5, pady=4)
 
-        # ── Area di Acquisizione ─────────────────
+        # ── Correzione Prospettica ───────────────
+        frm_persp = tk.LabelFrame(p, text="Correzione Prospettica", font=("Arial", 9, "bold"))
+        frm_persp.pack(**opt)
+
+        tk.Label(frm_persp,
+                 text="Ordine angoli (senso orario):\n"
+                      "1-TopLeft  2-TopRight  3-BotRight  4-BotLeft",
+                 font=("Arial", 8), justify="left", fg="#555"
+                 ).pack(anchor="w", padx=5, pady=(3, 1))
+
+        self.persp_status = tk.Label(frm_persp, text="Non attiva",
+                                     font=("Arial", 8, "bold"), fg="gray")
+        self.persp_status.pack(anchor="w", padx=5)
+
+        btn_row_p = tk.Frame(frm_persp)
+        btn_row_p.pack(fill="x", padx=5, pady=3)
+
+        self.persp_btn = tk.Button(btn_row_p, text="Seleziona 4 angoli",
+                                   command=self._start_perspective_selection,
+                                   bg="#c8e6ff", font=("Arial", 9, "bold"), height=1)
+        self.persp_btn.pack(side="left", fill="x", expand=True, padx=(0, 2))
+
+        tk.Button(btn_row_p, text="Reset",
+                  command=self._clear_perspective,
+                  bg="#ffcccc", font=("Arial", 9, "bold"), height=1
+                  ).pack(side="left")
+
+        # ── Aree di Acquisizione ─────────────────
         frm4 = tk.LabelFrame(p, text="Aree di Acquisizione", font=("Arial", 9, "bold"))
         frm4.pack(**opt)
 
-        # Listbox con le aree definite
         list_frame = tk.Frame(frm4)
-        list_frame.pack(fill="x", padx=5, pady=(4, 0))
+        list_frame.pack(fill="x", padx=5, pady=(3, 0))
 
-        self.area_listbox = tk.Listbox(list_frame, height=5, font=("Courier", 8),
+        self.area_listbox = tk.Listbox(list_frame, height=4, font=("Courier", 8),
                                        selectmode=tk.SINGLE, bg="#f9f9f9",
                                        xscrollcommand=lambda *a: sb_h.set(*a))
         self.area_listbox.grid(row=0, column=0, sticky="nsew")
@@ -642,12 +672,11 @@ class WebcamCaptureGUI:
 
         self.area_listbox.configure(yscrollcommand=sb_areas.set,
                                     xscrollcommand=sb_h.set)
-
         list_frame.columnconfigure(0, weight=1)
 
         rot_row = tk.Frame(frm4)
-        rot_row.pack(fill="x", padx=5, pady=(4, 0))
-        tk.Label(rot_row, text="Rotazione nuova area:", font=("Arial", 8)).pack(side="left")
+        rot_row.pack(fill="x", padx=5, pady=(3, 0))
+        tk.Label(rot_row, text="Rotazione:", font=("Arial", 8)).pack(side="left")
         self.rotation_var = tk.StringVar(value="0°")
         rot_cb = ttk.Combobox(rot_row, textvariable=self.rotation_var,
                               values=["0°", "90°", "180°", "270°"],
@@ -657,52 +686,20 @@ class WebcamCaptureGUI:
         btn_row = tk.Frame(frm4)
         btn_row.pack(fill="x", padx=5, pady=3)
 
-        tk.Button(btn_row, text="✏  Aggiungi Area",
+        tk.Button(btn_row, text="+ Aggiungi Area",
                   command=self._select_area,
-                  bg="#ffd080", font=("Arial", 9, "bold"), height=2
+                  bg="#ffd080", font=("Arial", 9, "bold"), height=1
                   ).pack(side="left", fill="x", expand=True, padx=(0, 2))
 
-        tk.Button(btn_row, text="🗑  Rimuovi",
+        tk.Button(btn_row, text="- Rimuovi",
                   command=self._remove_selected_area,
-                  bg="#ff9999", font=("Arial", 9, "bold"), height=2
+                  bg="#ff9999", font=("Arial", 9, "bold"), height=1
                   ).pack(side="left", fill="x", expand=True)
 
-        tk.Button(frm4, text="Rimuovi tutte le aree",
+        tk.Button(frm4, text="Rimuovi tutte",
                   command=self._clear_all_areas,
                   font=("Arial", 8)
-                  ).pack(fill="x", padx=5, pady=(0, 4))
-
-        # ── Correzione Prospettica ───────────────
-        frm_persp = tk.LabelFrame(p, text="Correzione Prospettica", font=("Arial", 9, "bold"))
-        frm_persp.pack(**opt)
-
-        # Istruzioni
-        tk.Label(frm_persp,
-                 text="Clicca i 4 angoli dello schermo\n"
-                      "in ordine:  ↖ ↗ ↘ ↙",
-                 font=("Arial", 8), justify="left", fg="#555"
-                 ).pack(anchor="w", padx=5, pady=(4, 2))
-
-        # Indicatore punti selezionati
-        self.persp_status = tk.Label(frm_persp,
-                                     text="● Non attiva",
-                                     font=("Arial", 8, "bold"), fg="gray")
-        self.persp_status.pack(anchor="w", padx=5)
-
-        # Bottoni
-        btn_row_p = tk.Frame(frm_persp)
-        btn_row_p.pack(fill="x", padx=5, pady=4)
-
-        self.persp_btn = tk.Button(btn_row_p,
-                                   text="⊹  Seleziona 4 angoli",
-                                   command=self._start_perspective_selection,
-                                   bg="#c8e6ff", font=("Arial", 9, "bold"), height=2)
-        self.persp_btn.pack(side="left", fill="x", expand=True, padx=(0, 2))
-
-        tk.Button(btn_row_p, text="✕  Reset",
-                  command=self._clear_perspective,
-                  bg="#ffcccc", font=("Arial", 9, "bold"), height=2
-                  ).pack(side="left")
+                  ).pack(fill="x", padx=5, pady=(0, 3))
 
         # ── Directory Salvataggio ────────────────
         frm5 = tk.LabelFrame(p, text="Directory Salvataggio", font=("Arial", 9, "bold"))
@@ -726,7 +723,7 @@ class WebcamCaptureGUI:
 
         self.server_btn = tk.Button(frm6, text="▶  Start Server",
                                     command=self._toggle_server,
-                                    bg="#8cff8c", font=("Arial", 10, "bold"), height=2)
+                                    bg="#8cff8c", font=("Arial", 9, "bold"), height=1)
         self.server_btn.pack(fill="x", padx=5, pady=4)
 
         self.server_status = tk.Label(frm6, text="● Offline",
@@ -742,10 +739,10 @@ class WebcamCaptureGUI:
         tk.Entry(frm7, textvariable=self.test_name_var,
                  font=("Arial", 8)).pack(fill="x", padx=5, pady=2)
 
-        tk.Button(frm7, text="📷  Cattura ora",
+        tk.Button(frm7, text="Cattura ora",
                   command=self._test_capture,
-                  bg="#80ccff", font=("Arial", 10, "bold"), height=2
-                  ).pack(fill="x", padx=5, pady=5)
+                  bg="#80ccff", font=("Arial", 9, "bold"), height=1
+                  ).pack(fill="x", padx=5, pady=4)
 
         tk.Label(p, text="", height=2).pack()  # spazio extra per scroll
 
@@ -909,11 +906,11 @@ class WebcamCaptureGUI:
     # ─────────────────────────────────────────
     #  Correzione prospettica
     # ─────────────────────────────────────────
-    _PERSP_LABELS = ["↖ Top-Left", "↗ Top-Right", "↘ Bottom-Right", "↙ Bottom-Left"]
-    _PERSP_COLORS = [(255, 80,  80),   # rosso
-                     (80,  200, 80),   # verde
-                     (80,  80,  255),  # blu
-                     (200, 200, 0)]    # giallo
+    _PERSP_LABELS = ["1-TopLeft", "2-TopRight", "3-BotRight", "4-BotLeft"]
+    _PERSP_COLORS = [(80,  80,  255),   # blu    → 1 Top-Left
+                     (80,  200, 80),    # verde  → 2 Top-Right
+                     (255, 80,  80),    # rosso  → 3 Bot-Right
+                     (200, 200, 0  )]   # giallo → 4 Bot-Left
 
     def _start_perspective_selection(self):
         if not self._live_running:
@@ -932,7 +929,7 @@ class WebcamCaptureGUI:
         self.preview_panel.config(cursor="crosshair")
         self.persp_btn.config(text="Annulla selezione", bg="#ffcccc")
         self._update_persp_status()
-        self._log("[INFO] Clicca i 4 angoli nell'ordine:  ↖ ↗ ↘ ↙")
+        self._log("[INFO] Clicca i 4 angoli in senso orario:  1-TopLeft  2-TopRight  3-BotRight  4-BotLeft")
 
     def _add_perspective_point(self, dx, dy):
         """Aggiunge un angolo cliccato sull'anteprima."""
@@ -952,9 +949,11 @@ class WebcamCaptureGUI:
         if len(app.perspective_points) == 4:
             self._selecting_perspective = False
             self.preview_panel.config(cursor="")
-            self.persp_btn.config(text="⊹  Seleziona 4 angoli", bg="#c8e6ff")
+            self.persp_btn.config(text="Seleziona 4 angoli", bg="#c8e6ff")
 
             if compute_perspective_matrix():
+                # Rimuovi i pallini dall'anteprima — la correzione è attiva
+                self._persp_points_display = []
                 self._update_persp_status()
             else:
                 self._log("[ERRORE] Impossibile calcolare la correzione — riprova")
@@ -976,15 +975,15 @@ class WebcamCaptureGUI:
         n = len(app.perspective_points)
         if app.perspective_matrix is not None:
             self.persp_status.config(
-                text=f"● Attiva  →  output {app.perspective_dst_w}x{app.perspective_dst_h}px",
+                text=f"Attiva  →  output {app.perspective_dst_w}x{app.perspective_dst_h}px",
                 fg="green")
-        elif n > 0:
+        elif n > 0 and n < 4:
             labels = self._PERSP_LABELS
             self.persp_status.config(
-                text=f"● {n}/4  →  clicca {labels[n]}",
+                text=f"{n}/4  →  clicca {labels[n]}",
                 fg="orange")
-        else:
-            self.persp_status.config(text="● Non attiva", fg="gray")
+        elif n == 0:
+            self.persp_status.config(text="Non attiva", fg="gray")
 
     # ─────────────────────────────────────────
     #  Mouse handlers per selezione su anteprima
