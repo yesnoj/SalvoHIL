@@ -63,7 +63,48 @@ Niente altro. Il file salvato si trova nel percorso restituito.
 
 ---
 
-## Aree di acquisizione
+## Correzione Prospettica
+
+Se la camera non è perfettamente perpendicolare allo schermo, l'immagine risulterà deformata (trapezoidale). La correzione prospettica raddrizza automaticamente ogni cattura prima del ritaglio ROI.
+
+```
+Camera inclinata:          Dopo correzione:
+
+ ╱──────────────╲          ┌──────────────┐
+╱                ╲    →    │              │
+╲                ╱         │              │
+ ╲______________╱          └──────────────┘
+
+   (trapezio)               (rettangolo)
+```
+
+### Come configurarla
+
+1. Avvia il Live View
+2. Clicca **⊹ Seleziona 4 angoli** nella sezione "Correzione Prospettica"
+3. Il cursore diventa una croce — clicca i 4 angoli dello schermo **nell'ordine**:
+   - **↖ Top-Left** (angolo in alto a sinistra)
+   - **↗ Top-Right** (angolo in alto a destra)
+   - **↘ Bottom-Right** (angolo in basso a destra)
+   - **↙ Bottom-Left** (angolo in basso a sinistra)
+4. Ogni punto viene marcato con un cerchio colorato sull'anteprima
+5. Al 4° punto la matrice viene calcolata automaticamente e l'anteprima si raddrizza in tempo reale
+
+Lo stato diventa `● Attiva → output 1280x720px` e da quel momento tutte le catture vengono corrette.
+
+### Pipeline di elaborazione
+
+```
+Frame grezzo  →  Correzione prospettica  →  Crop ROI  →  Rotazione  →  Salva
+```
+
+La correzione è **globale**: viene applicata una volta sola a tutto il frame, poi le ROI vengono ritagliate sul frame già corretto. Non è necessario riconfigurare le aree dopo aver impostato la correzione.
+
+Per rimuoverla: clicca **✕ Reset**.
+
+---
+
+
 
 È possibile definire un numero illimitato di aree indipendenti, ognuna con il proprio **ID numerico** e **rotazione**.
 

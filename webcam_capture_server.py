@@ -43,6 +43,12 @@ class AppState:
         self.rois = {}   # {id(int): (x1, y1, x2, y2, rotation)}
                          # rotation: 0, 90, 180, 270
 
+        # ── Correzione prospettica (globale, applicata prima del crop ROI) ──
+        self.perspective_points  = []    # lista di 4 (x, y) in coordinate frame reale
+        self.perspective_matrix  = None  # matrice 3x3 calcolata da cv2.getPerspectiveTransform
+        self.perspective_dst_w   = 0     # larghezza output dopo correzione
+        self.perspective_dst_h   = 0     # altezza output dopo correzione
+
         self.server_running = False
         self.server_socket  = None
         self.server_port    = 5005
@@ -221,6 +227,67 @@ def save_image(frame, filepath):
         return False
 
 
+def apply_perspective_correction(frame):
+    """
+    Applica la correzione prospettica globale al frame se configurata.
+    Trasforma il quadrilatero definito dai 4 angoli in un rettangolo perfetto.
+    Se non configurata, ritorna il frame invariato.
+    """
+    if app.perspective_matrix is None:
+        return frame
+    try:
+        corrected = cv2.warpPerspective(
+            frame,
+            app.perspective_matrix,
+            (app.perspective_dst_w, app.perspective_dst_h)
+        )
+        return corrected
+    except Exception as e:
+        app.log_fn(f"[WARN] Correzione prospettica fallita: {e}")
+        return frame
+
+
+def compute_perspective_matrix():
+    """
+    Calcola la matrice di trasformazione prospettica dai 4 punti selezionati.
+    I punti devono essere in ordine: top-left, top-right, bottom-right, bottom-left.
+    La dimensione di output viene calcolata automaticamente dalla media dei lati.
+    """
+    if len(app.perspective_points) != 4:
+        return False
+    try:
+        import numpy as np
+        pts = np.float32(app.perspective_points)
+
+        # Calcola dimensione output automaticamente dalla geometria dei 4 punti
+        tl, tr, br, bl = pts
+        w1 = np.linalg.norm(br - bl)
+        w2 = np.linalg.norm(tr - tl)
+        h1 = np.linalg.norm(tr - br)
+        h2 = np.linalg.norm(tl - bl)
+        dst_w = int(max(w1, w2))
+        dst_h = int(max(h1, h2))
+
+        if dst_w <= 0 or dst_h <= 0:
+            return False
+
+        dst_pts = np.float32([
+            [0,         0        ],
+            [dst_w - 1, 0        ],
+            [dst_w - 1, dst_h - 1],
+            [0,         dst_h - 1]
+        ])
+
+        app.perspective_matrix = cv2.getPerspectiveTransform(pts, dst_pts)
+        app.perspective_dst_w  = dst_w
+        app.perspective_dst_h  = dst_h
+        app.log_fn(f"[OK] Matrice prospettica calcolata → output: {dst_w}x{dst_h}px")
+        return True
+    except Exception as e:
+        app.log_fn(f"[ERRORE] Calcolo matrice prospettica: {e}")
+        return False
+
+
 # ─────────────────────────────────────────────
 #  Server socket
 # ─────────────────────────────────────────────
@@ -328,6 +395,8 @@ def _process_command(command, log_fn):
         if frame is None:
             return "ERROR:impossibile acquisire frame dalla webcam"
 
+        # Pipeline: prospettiva → crop ROI → rotazione → salva
+        frame     = apply_perspective_correction(frame)
         roi_frame = capture_roi(frame, area_id)
 
         if save_image(roi_frame, filepath):
@@ -470,6 +539,10 @@ class WebcamCaptureGUI:
         self._sel_start      = None
         self._sel_current    = None
         self._next_area_id   = 1     # ID che verrà assegnato alla prossima area
+
+        # Stato selezione angoli correzione prospettica
+        self._selecting_perspective = False   # True mentre si stanno selezionando i 4 angoli
+        self._persp_points_display  = []      # punti in coordinate display (per disegnarli)
         # Parametri di scala usati nell'ultimo frame visualizzato
         # servono per convertire coordinate display → coordinate frame reale
         self._disp_scale     = 1.0
@@ -598,6 +671,38 @@ class WebcamCaptureGUI:
                   command=self._clear_all_areas,
                   font=("Arial", 8)
                   ).pack(fill="x", padx=5, pady=(0, 4))
+
+        # ── Correzione Prospettica ───────────────
+        frm_persp = tk.LabelFrame(p, text="Correzione Prospettica", font=("Arial", 9, "bold"))
+        frm_persp.pack(**opt)
+
+        # Istruzioni
+        tk.Label(frm_persp,
+                 text="Clicca i 4 angoli dello schermo\n"
+                      "in ordine:  ↖ ↗ ↘ ↙",
+                 font=("Arial", 8), justify="left", fg="#555"
+                 ).pack(anchor="w", padx=5, pady=(4, 2))
+
+        # Indicatore punti selezionati
+        self.persp_status = tk.Label(frm_persp,
+                                     text="● Non attiva",
+                                     font=("Arial", 8, "bold"), fg="gray")
+        self.persp_status.pack(anchor="w", padx=5)
+
+        # Bottoni
+        btn_row_p = tk.Frame(frm_persp)
+        btn_row_p.pack(fill="x", padx=5, pady=4)
+
+        self.persp_btn = tk.Button(btn_row_p,
+                                   text="⊹  Seleziona 4 angoli",
+                                   command=self._start_perspective_selection,
+                                   bg="#c8e6ff", font=("Arial", 9, "bold"), height=2)
+        self.persp_btn.pack(side="left", fill="x", expand=True, padx=(0, 2))
+
+        tk.Button(btn_row_p, text="✕  Reset",
+                  command=self._clear_perspective,
+                  bg="#ffcccc", font=("Arial", 9, "bold"), height=2
+                  ).pack(side="left")
 
         # ── Directory Salvataggio ────────────────
         frm5 = tk.LabelFrame(p, text="Directory Salvataggio", font=("Arial", 9, "bold"))
@@ -802,6 +907,86 @@ class WebcamCaptureGUI:
         self._update_area_listbox()
 
     # ─────────────────────────────────────────
+    #  Correzione prospettica
+    # ─────────────────────────────────────────
+    _PERSP_LABELS = ["↖ Top-Left", "↗ Top-Right", "↘ Bottom-Right", "↙ Bottom-Left"]
+    _PERSP_COLORS = [(255, 80,  80),   # rosso
+                     (80,  200, 80),   # verde
+                     (80,  80,  255),  # blu
+                     (200, 200, 0)]    # giallo
+
+    def _start_perspective_selection(self):
+        if not self._live_running:
+            if not (app.cap and app.cap.isOpened()):
+                if not initialize_webcam():
+                    self._log("[ERRORE] Webcam non disponibile")
+                    return
+            self._toggle_live_view()
+
+        # Reset
+        app.perspective_points     = []
+        app.perspective_matrix     = None
+        self._persp_points_display = []
+        self._selecting_perspective = True
+
+        self.preview_panel.config(cursor="crosshair")
+        self.persp_btn.config(text="Annulla selezione", bg="#ffcccc")
+        self._update_persp_status()
+        self._log("[INFO] Clicca i 4 angoli nell'ordine:  ↖ ↗ ↘ ↙")
+
+    def _add_perspective_point(self, dx, dy):
+        """Aggiunge un angolo cliccato sull'anteprima."""
+        labels = self._PERSP_LABELS
+        n = len(app.perspective_points)
+        if n >= 4:
+            return
+
+        # Converti in coordinate frame reale
+        fx, fy = self._display_to_frame(dx, dy)
+        app.perspective_points.append((fx, fy))
+        self._persp_points_display.append((dx, dy))
+
+        self._log(f"[INFO] Punto {n+1}/4 ({labels[n]}): frame=({fx},{fy})")
+        self._update_persp_status()
+
+        if len(app.perspective_points) == 4:
+            self._selecting_perspective = False
+            self.preview_panel.config(cursor="")
+            self.persp_btn.config(text="⊹  Seleziona 4 angoli", bg="#c8e6ff")
+
+            if compute_perspective_matrix():
+                self._update_persp_status()
+            else:
+                self._log("[ERRORE] Impossibile calcolare la correzione — riprova")
+                self._clear_perspective()
+
+    def _clear_perspective(self):
+        self._selecting_perspective     = False
+        app.perspective_points          = []
+        app.perspective_matrix          = None
+        app.perspective_dst_w           = 0
+        app.perspective_dst_h           = 0
+        self._persp_points_display      = []
+        self.preview_panel.config(cursor="")
+        self.persp_btn.config(text="⊹  Seleziona 4 angoli", bg="#c8e6ff")
+        self._update_persp_status()
+        self._log("[INFO] Correzione prospettica rimossa")
+
+    def _update_persp_status(self):
+        n = len(app.perspective_points)
+        if app.perspective_matrix is not None:
+            self.persp_status.config(
+                text=f"● Attiva  →  output {app.perspective_dst_w}x{app.perspective_dst_h}px",
+                fg="green")
+        elif n > 0:
+            labels = self._PERSP_LABELS
+            self.persp_status.config(
+                text=f"● {n}/4  →  clicca {labels[n]}",
+                fg="orange")
+        else:
+            self.persp_status.config(text="● Non attiva", fg="gray")
+
+    # ─────────────────────────────────────────
     #  Mouse handlers per selezione su anteprima
     # ─────────────────────────────────────────
     def _display_to_frame(self, dx, dy):
@@ -811,6 +996,11 @@ class WebcamCaptureGUI:
         return int(fx), int(fy)
 
     def _on_preview_press(self, event):
+        # Modalità selezione angoli prospettica
+        if self._selecting_perspective:
+            self._add_perspective_point(event.x, event.y)
+            return
+        # Modalità selezione area
         if not self._selecting_area:
             return
         self._sel_start   = (event.x, event.y)
@@ -872,7 +1062,6 @@ class WebcamCaptureGUI:
                 fname    = f"{base}_area{aid}{ext}"
                 response = _process_command(f"CAPTURE:{aid}:{fname}", self._log)
                 self._log(f"[TEST] Area {aid} → {response}")
-
         threading.Thread(target=_run, daemon=True).start()
 
     # ─────────────────────────────────────────
@@ -949,7 +1138,8 @@ class WebcamCaptureGUI:
 
         frame = grab_color_frame()   # thread-safe grazie al cam_lock
         if frame is not None:
-            display = frame.copy()
+            # Applica correzione prospettica all'anteprima (se attiva)
+            display = apply_perspective_correction(frame)
 
             # Disegna tutte le aree confermate con il loro ID
             for aid, (x1, y1, x2, y2, rotation) in app.rois.items():
@@ -984,11 +1174,22 @@ class WebcamCaptureGUI:
             if nw > 0 and nh > 0:
                 small = cv2.resize(display, (nw, nh), interpolation=cv2.INTER_AREA)
 
-                # Disegna il rettangolo di selezione in corso (se l'utente sta disegnando)
+                # Disegna i punti prospettici già confermati
+                colors = self._PERSP_COLORS
+                labels = self._PERSP_LABELS
+                for i, (pdx, pdy) in enumerate(self._persp_points_display):
+                    rx = int((pdx - x_off))
+                    ry = int((pdy - y_off))
+                    col = colors[i]
+                    cv2.circle(small, (rx, ry), 8, col, -1)
+                    cv2.circle(small, (rx, ry), 8, (255, 255, 255), 2)
+                    cv2.putText(small, labels[i], (rx + 12, ry + 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+
+                # Disegna il rettangolo di selezione area in corso
                 if self._selecting_area and self._sel_start and self._sel_current:
                     x1d, y1d = self._sel_start
                     x2d, y2d = self._sel_current
-                    # Converti da coordinate pannello a coordinate small (sottraiamo l'offset)
                     rx1 = x1d - x_off
                     ry1 = y1d - y_off
                     rx2 = x2d - x_off
