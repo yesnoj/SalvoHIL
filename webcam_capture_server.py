@@ -379,6 +379,18 @@ def _process_command(command, log_fn):
         except ValueError:
             return f"ERROR:area_id deve essere un numero intero (ricevuto: {parts[0]!r})"
 
+        # area_id=0 → cattura l'intero frame (dopo correzione prospettica se attiva)
+        if area_id == 0:
+            frame = grab_fresh_frame_for_capture()
+            if frame is None:
+                return "ERROR:impossibile acquisire frame dalla webcam"
+            frame = apply_perspective_correction(frame)
+            if save_image(frame, filepath):
+                log_fn(f"[SERVER] Frame intero → {filepath}")
+                return f"OK:{filepath}"
+            else:
+                return f"ERROR:salvataggio fallito → {filepath}"
+
         if area_id not in app.rois:
             return (f"ERROR:area {area_id} non esiste  |  "
                     f"aree disponibili: {list(app.rois.keys())}")

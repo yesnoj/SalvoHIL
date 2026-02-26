@@ -138,6 +138,9 @@ Cattura l'area specificata e salva il file.
 ```python
 from webcam_client import cattura
 
+# area_id=0 → intero frame visibile (con prospettica se attiva, senza crop ROI)
+percorso = cattura(0, "frame_intero.jpg")
+
 # Solo nome file → salvato nella directory configurata nel server
 percorso = cattura(1, "misura.jpg")
 
@@ -152,7 +155,7 @@ percorso = cattura(3, "sessione_A/misura.jpg")
 
 | Parametro | Tipo | Descrizione |
 |---|---|---|
-| `area_id` | int | ID dell'area (come configurato nella GUI) |
+| `area_id` | int | `0` = intero frame, `1`/`2`/`3`... = area configurata nella GUI |
 | `nome_file` | str | Nome file o percorso. Il formato dipende dall'estensione (`.jpg`, `.png`, `.bmp`, `.tiff`) |
 | `porta` | int | Porta TCP del server (default: `5005`) |
 
