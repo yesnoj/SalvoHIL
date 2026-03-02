@@ -2,6 +2,7 @@
 
 Sistema di acquisizione immagini da webcam con GUI di configurazione e server socket TCP.
 Permette a qualsiasi script Python esterno di catturare una o più aree dell'immagine con una singola riga di codice.
+Supporta opzionalmente l'invio di allarmi A-code sul bus CAN tramite interfaccia Vector.
 
 ---
 
@@ -10,8 +11,12 @@ Permette a qualsiasi script Python esterno di catturare una o più aree dell'imm
 ```
 webcam_capture_server.py   # Server principale con GUI
 webcam_client.py           # Modulo client da importare nel tuo codice
+alarm_can_sender.py        # Modulo CAN opzionale (solo se si usa la funzione allarmi)
+CVT.dbc                    # File DBC dei messaggi CAN (fornito separatamente)
 esempio_utilizzo.py        # Esempi pratici di utilizzo
 ```
+
+`alarm_can_sender.py` e `CVT.dbc` sono **opzionali**: se non presenti, il server funziona normalmente senza la sezione CAN.
 
 ---
 
@@ -23,6 +28,14 @@ esempio_utilizzo.py        # Esempi pratici di utilizzo
 ```bash
 pip install opencv-python Pillow
 ```
+
+Per la funzionalità CAN (opzionale):
+
+```bash
+pip install python-can cantools
+```
+
+Inoltre: driver XL Vector installato (già presente se CANalyzer/CANoe è installato sul PC).
 
 ---
 
@@ -45,9 +58,11 @@ Segui questo ordine nella GUI:
 3. Regola i **parametri webcam** con gli slider (contrasto, saturazione, esposizione, focus)
 4. Clicca **▶ Start Live View** per vedere l'anteprima in tempo reale
 5. Configura le **aree di acquisizione** (vedi sezione dedicata)
-6. Verifica il campo **Directory Salvataggio**
-7. Clicca **▶ Start Server** → lo stato diventa `● Online (porta 5005)`
-8. Testa con il bottone **📷 Cattura ora** prima di usare il client
+6. Se necessario, configura la **Correzione Prospettica**
+7. Se necessario, configura il **CAN Alarm Sender** (vedi sezione dedicata)
+8. Verifica il campo **Directory Salvataggio**
+9. Clicca **▶ Start Server** → lo stato diventa `● Online (porta 5005)`
+10. Testa con il bottone **Cattura ora** prima di usare il client
 
 ### 2 — Importa nel tuo codice
 
@@ -60,6 +75,21 @@ percorso = cattura(area_id=1, nome_file="misura.jpg")
 ```
 
 Niente altro. Il file salvato si trova nel percorso restituito.
+
+---
+
+## Aree di acquisizione
+
+Le aree si disegnano direttamente sull'anteprima Live View:
+
+1. Clicca **+ Aggiungi Area**
+2. Tieni premuto il tasto sinistro del mouse sull'anteprima e trascina per disegnare il rettangolo
+3. Rilascia per confermare → l'area viene aggiunta con ID progressivo (Area 1, Area 2, ...)
+4. Opzionale: scegli la **rotazione** (0°/90°/180°/270°) prima di aggiungere
+
+Per rimuovere un'area: selezionala nella lista e clicca **− Rimuovi**.
+
+Il client usa l'ID numerico (`area_id=1`, `area_id=2`, ...) per specificare quale area catturare.
 
 ---
 
@@ -81,7 +111,7 @@ Camera inclinata:          Dopo correzione:
 ### Come configurarla
 
 1. Avvia il Live View
-2. Clicca **⊹ Seleziona 4 angoli** nella sezione "Correzione Prospettica"
+2. Clicca **Seleziona 4 angoli** nella sezione "Correzione Prospettica"
 3. Il cursore diventa una croce — clicca i 4 angoli dello schermo **nell'ordine**:
    - **↖ Top-Left** (angolo in alto a sinistra)
    - **↗ Top-Right** (angolo in alto a destra)
@@ -92,71 +122,51 @@ Camera inclinata:          Dopo correzione:
 
 Lo stato diventa `● Attiva → output 1280x720px` e da quel momento tutte le catture vengono corrette.
 
-### Pipeline di elaborazione
+---
 
+## CAN Alarm Sender (opzionale)
+
+Permette di attivare allarmi A-code sul display fisico del veicolo via bus CAN, coordinando l'invio del segnale con la cattura della webcam.
+
+### Prerequisiti
+
+1. `alarm_can_sender.py` nella stessa cartella di `webcam_capture_server.py`
+2. `pip install python-can cantools`
+3. Driver XL Vector installato (VN1630 / VN1640 o compatibile)
+4. File `.dbc` con la definizione dei messaggi CAN
+
+### Configurazione nella GUI
+
+La sezione **CAN Alarm Sender** appare automaticamente nella barra sinistra solo se `alarm_can_sender.py` è presente nella cartella. Se il modulo non c'è, la sezione non viene mostrata e il server funziona normalmente.
+
+1. Clicca **...** per aprire il file picker e selezionare il file `.dbc`
+2. Imposta il **canale** Vector (0 = CH1 in CANalyzer/CANoe)
+3. Clicca **⚡ Connetti CAN** → lo stato diventa `● Connesso CH0 (38 allarmi)`
+
+Il CAN è indipendente dal server webcam: puoi connettere/disconnettere senza toccare la webcam.
+
+### Test standalone del modulo CAN
+
+Prima di usare il sistema completo, verifica che il bus funzioni:
+
+```bash
+python alarm_can_sender.py
 ```
-Frame grezzo  →  Correzione prospettica  →  Crop ROI  →  Rotazione  →  Salva
-```
 
-La correzione è **globale**: viene applicata una volta sola a tutto il frame, poi le ROI vengono ritagliate sul frame già corretto. Non è necessario riconfigurare le aree dopo aver impostato la correzione.
-
-Per rimuoverla: clicca **✕ Reset**.
+Il programma chiede il percorso del DBC e il canale, invia un allarme di prova e lo cancella dopo 3 secondi.
 
 ---
 
-
-
-È possibile definire un numero illimitato di aree indipendenti, ognuna con il proprio **ID numerico** e **rotazione**.
-
-### Come aggiungere un'area
-
-1. Scegli la **Rotazione** dal menu (`0°` / `90°` / `180°` / `270°`) — verrà applicata al salvataggio
-2. Clicca **✏ Aggiungi Area**
-3. Il cursore diventa una **croce** sull'anteprima
-4. **Trascina** per disegnare il rettangolo → rettangolo blu in tempo reale
-5. **Rilascia** per confermare → il rettangolo diventa verde con il numero area
-
-L'ID viene assegnato automaticamente in sequenza (1, 2, 3...).
-
-### Gestione aree
-
-| Azione | Come |
-|---|---|
-| Aggiungere | ✏ Aggiungi Area + disegna sull'anteprima |
-| Rimuovere una | Seleziona dalla lista → 🗑 Rimuovi |
-| Rimuovere tutte | Rimuovi tutte le aree |
-| Rotazione | Scelta prima di aggiungere (per area, indipendente) |
-
----
-
-## Utilizzo di `webcam_client.py`
+## API client — `webcam_client.py`
 
 ### `cattura(area_id, nome_file, porta=5005)`
 
 Cattura l'area specificata e salva il file.
 
-```python
-from webcam_client import cattura
-
-# area_id=0 → intero frame visibile (con prospettica se attiva, senza crop ROI)
-percorso = cattura(0, "frame_intero.jpg")
-
-# Solo nome file → salvato nella directory configurata nel server
-percorso = cattura(1, "misura.jpg")
-
-# Percorso assoluto → salvato esattamente lì
-percorso = cattura(2, "C:/Risultati/misura.png")
-
-# Sottocartella relativa alla directory del server
-percorso = cattura(3, "sessione_A/misura.jpg")
-```
-
-**Parametri:**
-
 | Parametro | Tipo | Descrizione |
 |---|---|---|
-| `area_id` | int | `0` = intero frame, `1`/`2`/`3`... = area configurata nella GUI |
-| `nome_file` | str | Nome file o percorso. Il formato dipende dall'estensione (`.jpg`, `.png`, `.bmp`, `.tiff`) |
+| `area_id` | int | ID dell'area configurata nella GUI |
+| `nome_file` | str | Nome file (`"misura.jpg"`) o percorso assoluto (`"C:/foto/img.png"`). Il formato dipende dall'estensione (`.jpg`, `.png`, `.bmp`, `.tiff`) |
 | `porta` | int | Porta TCP del server (default: `5005`) |
 
 **Ritorna:** `str` — percorso completo del file salvato
@@ -184,46 +194,102 @@ else:
 
 ---
 
-### Esempi completi
+### `mostra_allarme(alarm_id, porta=5005)`
 
-Vedi `esempio_utilizzo.py` per tutti i casi d'uso, oppure eseguilo direttamente:
+Attiva un allarme A-code sul display fisico via CAN.
 
-```bash
-python esempio_utilizzo.py
+| Parametro | Tipo | Descrizione |
+|---|---|---|
+| `alarm_id` | str | Codice allarme, es. `"A101"`. Case-insensitive. |
+| `porta` | int | Porta TCP del server (default: `5005`) |
+
+**Ritorna:** `str` — risposta del server es. `"OK:shown:A101"`
+
+**Eccezioni:** `RuntimeError` se l'alarm_id è sconosciuto o il CAN non è connesso.
+
+Se c'era già un allarme attivo, viene azzerato automaticamente prima di inviare il nuovo.
+
+---
+
+### `cancella_allarme(porta=5005)`
+
+Azzera il segnale CAN dell'ultimo allarme attivato. Non solleva eccezioni se non c'era nessun allarme attivo.
+
+---
+
+### `lista_allarmi(porta=5005)`
+
+Ritorna la lista degli A-code supportati dal server.
+
+```python
+alarms = lista_allarmi()
+# → ['A001', 'A002', 'A005', 'A006', ..., 'A503']
+```
+
+---
+
+### Esempio workflow completo (AutomationDesk)
+
+```python
+from webcam_client import cattura, mostra_allarme, cancella_allarme
+import time
+
+# 1. Attiva allarme sul display fisico
+mostra_allarme("A101")
+
+# 2. Attendi aggiornamento display
+time.sleep(2.0)
+
+# 3. Cattura l'area di interesse
+percorso = cattura(1, "alarm_A101.png")
+
+# 4. Analisi OCR / colori sull'immagine...
+
+# 5. Reset
+cancella_allarme()
 ```
 
 ---
 
 ## Protocollo socket
 
-La comunicazione avviene via **TCP su localhost**, porta `5005`.  
+La comunicazione avviene via **TCP su localhost**, porta `5005`.
 Comandi in testo terminati da `\n`.
 
 | Comando | Risposta successo | Risposta errore |
 |---|---|---|
 | `CAPTURE:area_id:nome_file\n` | `OK:/percorso/completo\n` | `ERROR:messaggio\n` |
 | `STATUS\n` | `READY:aree=[1, 2]\n` | `NOT_READY:motivo\n` |
+| `SHOW_ALARM:A101\n` | `OK:shown:A101\n` | `ERROR:messaggio\n` |
+| `CLEAR_ALARM\n` | `OK:cleared\n` | `ERROR:messaggio\n` |
+| `LIST_ALARMS\n` | `OK:A001,A002,...\n` | `ERROR:messaggio\n` |
 
 ---
 
 ## Architettura interna
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                  webcam_capture_server.py                    │
-│                                                              │
-│  [Grabber Thread]  cap.read() continuo → latest_frame       │
-│                              ↓                               │
-│  [GUI Thread]      Live View ~20fps, selezione aree mouse   │
-│                              ↓                               │
-│  [Server Thread]   TCP 127.0.0.1:5005                       │
-│                    CAPTURE:id:file → crop → rotazione → salva│
-└──────────────────────────────────────────────────────────────┘
-                    ↑ TCP localhost
-┌──────────────────────────────────────────────────────────────┐
-│  webcam_client.py                                            │
-│  cattura(area_id, nome_file)  ←── importato dal tuo codice  │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│                   webcam_capture_server.py                     │
+│                                                                │
+│  [Grabber Thread]   cap.read() continuo → latest_frame        │
+│                               ↓                                │
+│  [GUI Thread]       Live View ~20fps, selezione aree mouse    │
+│                               ↓                                │
+│  [Server Thread]    TCP 127.0.0.1:5005                        │
+│                     CAPTURE / STATUS / SHOW_ALARM / ...       │
+│                               ↓                                │
+│  [AlarmCanSender]   Bus Vector CAN → display fisico           │
+│                     (presente solo se alarm_can_sender.py      │
+│                      è nella cartella e CAN è connesso)        │
+└────────────────────────────────────────────────────────────────┘
+                     ↑ TCP localhost
+┌────────────────────────────────────────────────────────────────┐
+│  webcam_client.py                                              │
+│  cattura() · stato_server()                                    │
+│  mostra_allarme() · cancella_allarme() · lista_allarmi()      │
+│  ←── importato nel tuo codice / AutomationDesk                │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 I lock `cam_lock` e `frame_lock` garantiscono thread-safety tra Grabber, GUI e Server.
@@ -249,6 +315,7 @@ Tutti regolabili in tempo reale dagli slider senza riavviare:
 - La **rotazione** è configurata per area nella GUI e applicata automaticamente al salvataggio — il client non deve fare nulla di speciale.
 - Le **sottocartelle** nel percorso file vengono create automaticamente.
 - OpenCV usa **DirectShow** (`cv2.CAP_DSHOW`) su Windows per evitare ritardi di inizializzazione.
+- I nomi `msg` e `sig` in `ALARM_DICT` dentro `alarm_can_sender.py` devono corrispondere esattamente ai nomi nel file `.dbc` (case-sensitive). Verificare con CANdb++ prima del deploy.
 
 ---
 

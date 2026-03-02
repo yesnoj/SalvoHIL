@@ -23,6 +23,13 @@ import socket
 import os
 import time
 
+# ── Alarm CAN sender (opzionale: richiede python-can + cantools + driver Vector) ──
+try:
+    from alarm_can_sender import AlarmCanSender, CAN_AVAILABLE
+except ImportError:
+    AlarmCanSender = None
+    CAN_AVAILABLE  = False
+
 
 # ─────────────────────────────────────────────
 #  Stato applicazione
@@ -69,6 +76,14 @@ class AppState:
 
 
 app = AppState()
+
+
+# ─────────────────────────────────────────────
+#  Configurazione CAN Alarm Sender
+#  ← Adattare qui percorso DBC, canale e nome app
+# ─────────────────────────────────────────────
+# _alarm_sender viene inizializzato dalla GUI quando l'utente seleziona il DBC
+_alarm_sender = None
 
 
 # ─────────────────────────────────────────────
@@ -422,6 +437,25 @@ def _process_command(command, log_fn):
         else:
             return f"ERROR:salvataggio fallito → {filepath}"
 
+    if command.strip().upper().startswith("SHOW_ALARM:"):
+        alarm_id = command.split(":", 1)[1].strip()
+        if _alarm_sender is None:
+            return "ERROR:CAN non inizializzato (alarm_can_sender non disponibile)"
+        ok = _alarm_sender.show_alarm(alarm_id)
+        return f"OK:shown:{alarm_id}" if ok else f"ERROR:allarme {alarm_id} non trovato nel dizionario"
+
+    if command.strip().upper() == "CLEAR_ALARM":
+        if _alarm_sender is None:
+            return "ERROR:CAN non inizializzato (alarm_can_sender non disponibile)"
+        _alarm_sender.clear_alarm()
+        return "OK:cleared"
+
+    if command.strip().upper() == "LIST_ALARMS":
+        if AlarmCanSender is None:
+            return "ERROR:alarm_can_sender non disponibile"
+        alarms = AlarmCanSender.list_alarms()
+        return f"OK:{','.join(alarms)}"
+
     return f"ERROR:comando non riconosciuto → {command!r}"
 
 
@@ -721,6 +755,10 @@ class WebcamCaptureGUI:
         e = tk.Entry(frm5, textvariable=self.dir_var, font=("Arial", 8))
         e.pack(fill="x", padx=5, pady=4)
         e.bind("<FocusOut>", lambda ev: setattr(app, "save_directory", self.dir_var.get()))
+
+        # ── CAN Alarm Sender (solo se alarm_can_sender.py è presente) ──
+        if AlarmCanSender is not None:
+            self._build_can_panel(p, opt)
 
         # ── Server Socket ─────────────────────────
         frm6 = tk.LabelFrame(p, text="Server Socket", font=("Arial", 9, "bold"))
@@ -1078,6 +1116,90 @@ class WebcamCaptureGUI:
     # ─────────────────────────────────────────
     #  Server
     # ─────────────────────────────────────────
+    # ─────────────────────────────────────────
+    #  Pannello CAN
+    # ─────────────────────────────────────────
+    def _build_can_panel(self, p, opt):
+        """Costruisce la sezione CAN Alarm nella barra sinistra."""
+        from tkinter import filedialog
+        frm_can = tk.LabelFrame(p, text="CAN Alarm Sender", font=("Arial", 9, "bold"))
+        frm_can.pack(**opt)
+
+        # Riga file DBC
+        tk.Label(frm_can, text="File DBC:", font=("Arial", 8)).pack(anchor="w", padx=5, pady=(4, 0))
+        dbc_row = tk.Frame(frm_can)
+        dbc_row.pack(fill="x", padx=5, pady=2)
+
+        self.can_dbc_var = tk.StringVar(value="")
+        tk.Entry(dbc_row, textvariable=self.can_dbc_var,
+                 font=("Arial", 8)).pack(side="left", fill="x", expand=True)
+        tk.Button(dbc_row, text="...",
+                  command=self._browse_dbc,
+                  font=("Arial", 8), width=3).pack(side="left", padx=(3, 0))
+
+        # Riga canale
+        ch_row = tk.Frame(frm_can)
+        ch_row.pack(fill="x", padx=5, pady=2)
+        tk.Label(ch_row, text="Canale (0=CH1):", font=("Arial", 8)).pack(side="left")
+        self.can_ch_var = tk.StringVar(value="0")
+        tk.Spinbox(ch_row, from_=0, to=7, textvariable=self.can_ch_var,
+                   width=4, font=("Arial", 8)).pack(side="left", padx=6)
+
+        # Pulsante connetti
+        self.can_btn = tk.Button(frm_can, text="⚡  Connetti CAN",
+                                 command=self._toggle_can,
+                                 bg="#c8e6ff", font=("Arial", 9, "bold"), height=1)
+        self.can_btn.pack(fill="x", padx=5, pady=4)
+
+        self.can_status = tk.Label(frm_can, text="● Offline",
+                                   fg="red", font=("Arial", 9, "bold"))
+        self.can_status.pack(padx=5, pady=(0, 5))
+
+    def _browse_dbc(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Seleziona file DBC",
+            filetypes=[("DBC files", "*.dbc"), ("All files", "*.*")]
+        )
+        if path:
+            self.can_dbc_var.set(path)
+
+    def _toggle_can(self):
+        global _alarm_sender
+        if _alarm_sender is not None:
+            # Disconnetti
+            _alarm_sender.shutdown()
+            _alarm_sender = None
+            self.can_btn.config(text="⚡  Connetti CAN", bg="#c8e6ff")
+            self.can_status.config(text="● Offline", fg="red")
+            self._log("[CAN] Bus disconnesso")
+        else:
+            # Connetti
+            dbc = self.can_dbc_var.get().strip()
+            if not dbc:
+                self._log("[CAN] Seleziona prima il file DBC")
+                return
+            try:
+                ch = int(self.can_ch_var.get())
+            except ValueError:
+                self._log("[CAN] Canale non valido")
+                return
+            try:
+                _alarm_sender = AlarmCanSender(
+                    dbc_path=dbc,
+                    channel=ch,
+                    app_name="SalvoHIL",
+                )
+                self.can_btn.config(text="■  Disconnetti CAN", bg="#ff8c8c")
+                self.can_status.config(
+                    text=f"● Connesso  CH{ch}  ({len(AlarmCanSender.list_alarms())} allarmi)",
+                    fg="green"
+                )
+                self._log(f"[CAN] Bus aperto — DBC:{dbc}  CH:{ch}")
+            except Exception as e:
+                self._log(f"[CAN] Errore connessione: {e}")
+                self.can_status.config(text="● Errore", fg="orange")
+
     def _toggle_server(self):
         if app.server_running:
             app.server_running = False
@@ -1228,6 +1350,8 @@ class WebcamCaptureGUI:
                 app.server_socket.close()
             except Exception:
                 pass
+        if _alarm_sender is not None:
+            _alarm_sender.shutdown()
         release_webcam()
         cv2.destroyAllWindows()
         self.root.destroy()
