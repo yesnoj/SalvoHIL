@@ -162,10 +162,12 @@ class AlarmCanSender:
         self._db = cantools.database.load_file(str(path))
 
         # Parametri bus allineati a FinalDTC_PaddleOCR.py / create_can_bus()
+        # NOTA: app_name NON viene passato a can.interface.Bus() perché il nome
+        # dell'applicazione deve essere registrato nel Vector Hardware Config.
+        # Se non registrato, il driver XL rifiuta la connessione silenziosamente.
         self._bus = can.interface.Bus(
             interface="vector",
             channel=channel,
-            app_name=app_name,
             bitrate=bitrate,
             fd=False,
             receive_own_messages=False,

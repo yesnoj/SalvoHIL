@@ -1145,6 +1145,16 @@ class WebcamCaptureGUI:
         tk.Spinbox(ch_row, from_=0, to=7, textvariable=self.can_ch_var,
                    width=4, font=("Arial", 8)).pack(side="left", padx=6)
 
+        # Riga bitrate
+        br_row = tk.Frame(frm_can)
+        br_row.pack(fill="x", padx=5, pady=2)
+        tk.Label(br_row, text="Bitrate:", font=("Arial", 8)).pack(side="left")
+        self.can_bitrate_var = tk.StringVar(value="250000")
+        ttk.Combobox(br_row, textvariable=self.can_bitrate_var,
+                     values=["125000", "250000", "500000", "1000000"],
+                     state="readonly", width=10,
+                     ).pack(side="left", padx=6)
+
         # Pulsante connetti
         self.can_btn = tk.Button(frm_can, text="⚡  Connetti CAN",
                                  command=self._toggle_can,
@@ -1185,19 +1195,26 @@ class WebcamCaptureGUI:
                 self._log("[CAN] Canale non valido")
                 return
             try:
+                bitrate = int(self.can_bitrate_var.get())
+            except ValueError:
+                self._log("[CAN] Bitrate non valido")
+                return
+            try:
                 _alarm_sender = AlarmCanSender(
                     dbc_path=dbc,
                     channel=ch,
-                    app_name="SalvoHIL",
+                    bitrate=bitrate,
                 )
                 self.can_btn.config(text="■  Disconnetti CAN", bg="#ff8c8c")
                 self.can_status.config(
-                    text=f"● Connesso  CH{ch}  ({len(AlarmCanSender.list_alarms())} allarmi)",
+                    text=f"● Connesso  CH{ch}  {bitrate//1000}k  ({len(AlarmCanSender.list_alarms())} allarmi)",
                     fg="green"
                 )
-                self._log(f"[CAN] Bus aperto — DBC:{dbc}  CH:{ch}")
+                self._log(f"[CAN] Bus aperto — DBC:{dbc}  CH:{ch}  {bitrate}bps")
             except Exception as e:
+                import traceback
                 self._log(f"[CAN] Errore connessione: {e}")
+                self._log(f"[CAN] Dettaglio: {traceback.format_exc().splitlines()[-2]}")
                 self.can_status.config(text="● Errore", fg="orange")
 
     def _toggle_server(self):
