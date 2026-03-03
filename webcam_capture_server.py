@@ -375,9 +375,9 @@ def _process_command(command, log_fn):
     if command.strip().upper() == "STATUS":
         if app.cap is None or not app.cap.isOpened():
             return "NOT_READY:webcam non aperta"
-        if not app.rois:
-            return "NOT_READY:nessuna area selezionata"
-        return f"READY:aree={list(app.rois.keys())}"
+        # Le aree sono opzionali: area_id=0 cattura il frame intero senza ROI
+        aree = list(app.rois.keys()) if app.rois else [0]
+        return f"READY:aree={aree}"
 
     if command.upper().startswith("CAPTURE:"):
         rest = command[len("CAPTURE:"):].strip()
@@ -394,6 +394,15 @@ def _process_command(command, log_fn):
         except ValueError:
             return f"ERROR:area_id deve essere un numero intero (ricevuto: {parts[0]!r})"
 
+        filename = parts[1].strip()
+        if not filename:
+            return "ERROR:nome file mancante"
+
+        if not os.path.isabs(filename):
+            filepath = os.path.join(app.save_directory, filename)
+        else:
+            filepath = filename
+
         # area_id=0 → cattura l'intero frame (dopo correzione prospettica se attiva)
         if area_id == 0:
             frame = grab_fresh_frame_for_capture()
@@ -409,15 +418,6 @@ def _process_command(command, log_fn):
         if area_id not in app.rois:
             return (f"ERROR:area {area_id} non esiste  |  "
                     f"aree disponibili: {list(app.rois.keys())}")
-
-        filename = parts[1].strip()
-        if not filename:
-            return "ERROR:nome file mancante"
-
-        if not os.path.isabs(filename):
-            filepath = os.path.join(app.save_directory, filename)
-        else:
-            filepath = filename
 
         dirpath = os.path.dirname(filepath)
         if dirpath:

@@ -151,6 +151,9 @@ class AlarmCanSender:
     bitrate   : bitrate in bps (default 250 000)
     """
 
+    # Periodo di trasmissione ciclica in secondi (20 ms = 50 Hz, tipico J1939)
+    CYCLIC_PERIOD_S = 0.020
+
     def __init__(self, dbc_path, channel=0, app_name="SalvoHIL", bitrate=250_000):
         if not CAN_AVAILABLE:
             raise RuntimeError("Installare: pip install python-can cantools")
@@ -178,10 +181,19 @@ class AlarmCanSender:
             timing=None,
         )
 
-        self._lock         = threading.Lock()
+        self._lock         = threading.RLock()  # RLock: consente acquisizione rientrante nello stesso thread
         self._active_alarm = None   # dict con i dati dell'allarme attivo
+
+        # Trasmissione ciclica
+        self._cyclic_stop  = threading.Event()
+        self._cyclic_thread = threading.Thread(
+            target=self._cyclic_loop, daemon=True, name="CAN-cyclic"
+        )
+        self._cyclic_thread.start()
+
         logging.info(
-            f"AlarmCanSender pronto — DBC:{dbc_path}  CH:{channel}  app:{app_name}"
+            f"AlarmCanSender pronto — DBC:{dbc_path}  CH:{channel}  "
+            f"ciclo={int(self.CYCLIC_PERIOD_S*1000)}ms"
         )
 
     # ─────────────────────── metodi privati ───────────────────────────────────
@@ -232,6 +244,22 @@ class AlarmCanSender:
         logging.info(f"Allarme {e['id']} cancellato (segnali → 0)")
         self._active_alarm = None
 
+    def _cyclic_loop(self):
+        """Thread daemon: ritrasmette ciclicamente l'allarme attivo ogni CYCLIC_PERIOD_S.
+        I nodi CAN hanno tipicamente timeout 100-500 ms; senza ciclo il segnale
+        e considerato stale e ignorato dall'ECU/cluster.
+        """
+        import time
+        while not self._cyclic_stop.is_set():
+            with self._lock:
+                alarm = self._active_alarm
+            if alarm is not None:
+                try:
+                    self._send_alarm_signals(alarm)
+                except Exception as e:
+                    logging.warning(f"[CAN cyclic] errore TX: {e}")
+            self._cyclic_stop.wait(self.CYCLIC_PERIOD_S)
+
     # ─────────────────────── API pubblica ─────────────────────────────────────
 
     def show_alarm(self, alarm_id):
@@ -255,36 +283,51 @@ class AlarmCanSender:
             logging.warning(f"Allarme sconosciuto: {alarm_id}")
             return False
 
-        if self._active_alarm is not None:
-            self._clear_active()
+        with self._lock:
+            if self._active_alarm is not None:
+                # Azzeramento sincrono prima di cambiare allarme
+                self._send_alarm_signals(self._active_alarm, value_override=0)
+                logging.info(f"Allarme {self._active_alarm['id']} cancellato (cambio allarme)")
+                self._active_alarm = None
 
-        self._send_alarm_signals(entry)
-        self._active_alarm = {**entry, "id": alarm_id}
-        logging.info(f"Allarme {alarm_id} attivato")
+            # Prima trasmissione immediata, poi il thread ciclico continua
+            self._send_alarm_signals(entry)
+            self._active_alarm = {**entry, "id": alarm_id}
+
+        logging.info(f"Allarme {alarm_id} attivato (ciclico {int(self.CYCLIC_PERIOD_S*1000)}ms)")
         return True
 
     def clear_alarm(self):
         """
-        Azzera i segnali CAN dell'ultimo allarme attivato.
+        Azzera i segnali CAN dell'ultimo allarme attivato e ferma la trasmissione ciclica.
 
         Ritorna
         -------
         True  se c'era un allarme attivo (e lo ha azzerato)
         False se non c'era nessun allarme attivo
         """
-        if self._active_alarm is None:
-            logging.info("clear_alarm: nessun allarme attivo")
-            return False
-        self._clear_active()
+        with self._lock:
+            if self._active_alarm is None:
+                logging.info("clear_alarm: nessun allarme attivo")
+                return False
+            self._send_alarm_signals(self._active_alarm, value_override=0)
+            logging.info(f"Allarme {self._active_alarm['id']} cancellato (segnali -> 0)")
+            self._active_alarm = None
         return True
 
     def shutdown(self):
         """
-        Azzera l'eventuale allarme attivo e chiude il bus CAN.
+        Azzera l'eventuale allarme attivo, ferma il thread ciclico e chiude il bus CAN.
         Viene chiamato automaticamente da webcam_capture_server._on_close().
         """
-        if self._active_alarm is not None:
-            self._clear_active()
+        # Ferma il thread ciclico
+        self._cyclic_stop.set()
+        self._cyclic_thread.join(timeout=1.0)
+        # Azzera l'ultimo allarme
+        with self._lock:
+            if self._active_alarm is not None:
+                self._send_alarm_signals(self._active_alarm, value_override=0)
+                self._active_alarm = None
         self._bus.shutdown()
         logging.info("AlarmCanSender: bus CAN chiuso.")
 
