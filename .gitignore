@@ -1,2 +1,13 @@
 __pycache__/alarm_can_sender.cpython-312.pyc
 *.pyc
+build/webcam_capture_server/xref-webcam_capture_server.html
+build/webcam_capture_server/webcam_capture_server.pkg
+build/webcam_capture_server/warn-webcam_capture_server.txt
+build/webcam_capture_server/PYZ-00.toc
+build/webcam_capture_server/PYZ-00.pyz
+build/webcam_capture_server/PKG-00.toc
+build/webcam_capture_server/EXE-00.toc
+build/webcam_capture_server/base_library.zip
+build/webcam_capture_server/Analysis-00.toc
+__pycache__/alarm_can_sender.cpython-312.pyc
+*.pyc

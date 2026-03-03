@@ -44,8 +44,10 @@ class AppState:
 
         self.webcam_contrast   = 7
         self.webcam_saturation = 60
-        self.webcam_exposure   = -8
+        self.webcam_shutter    = -6   # CAP_PROP_EXPOSURE: shutter speed (2^n secondi)
+        self.webcam_gain       = 0    # CAP_PROP_GAIN: ISO/gain analogico (0-255)
         self.webcam_focus      = 73
+        self.webcam_sharpness  = 128
 
         self.rois = {}   # {id(int): (x1, y1, x2, y2, rotation)}
                          # rotation: 0, 90, 180, 270
@@ -59,7 +61,13 @@ class AppState:
         self.server_running = False
         self.server_socket  = None
         self.server_port    = 5005
-        self.save_directory = os.path.dirname(os.path.abspath(__file__))
+        # Quando gira come .exe PyInstaller, __file__ punta alla cartella temp.
+        # sys.executable punta invece al vero .exe, quindi usiamo la sua directory.
+        import sys
+        if getattr(sys, 'frozen', False):
+            self.save_directory = os.path.dirname(sys.executable)
+        else:
+            self.save_directory = os.path.dirname(os.path.abspath(__file__))
 
         # ── LOCK: accesso esclusivo alla webcam (apertura/chiusura/parametri) ──
         self.cam_lock = threading.Lock()
@@ -138,7 +146,9 @@ def _apply_webcam_params():
         return
     app.cap.set(cv2.CAP_PROP_CONTRAST,   float(app.webcam_contrast))
     app.cap.set(cv2.CAP_PROP_SATURATION, float(app.webcam_saturation))
-    app.cap.set(cv2.CAP_PROP_EXPOSURE,   float(app.webcam_exposure))
+    app.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)              # 1 = manual (DirectShow)
+    app.cap.set(cv2.CAP_PROP_EXPOSURE,      float(app.webcam_shutter))
+    app.cap.set(cv2.CAP_PROP_GAIN,          float(app.webcam_gain))
     try:
         app.cap.set(cv2.CAP_PROP_FOCUS, float(app.webcam_focus))
     except Exception:
@@ -375,9 +385,9 @@ def _process_command(command, log_fn):
     if command.strip().upper() == "STATUS":
         if app.cap is None or not app.cap.isOpened():
             return "NOT_READY:webcam non aperta"
-        # Le aree sono opzionali: area_id=0 cattura il frame intero senza ROI
-        aree = list(app.rois.keys()) if app.rois else [0]
-        return f"READY:aree={aree}"
+        if not app.rois:
+            return "NOT_READY:nessuna area selezionata"
+        return f"READY:aree={list(app.rois.keys())}"
 
     if command.upper().startswith("CAPTURE:"):
         rest = command[len("CAPTURE:"):].strip()
@@ -394,15 +404,6 @@ def _process_command(command, log_fn):
         except ValueError:
             return f"ERROR:area_id deve essere un numero intero (ricevuto: {parts[0]!r})"
 
-        filename = parts[1].strip()
-        if not filename:
-            return "ERROR:nome file mancante"
-
-        if not os.path.isabs(filename):
-            filepath = os.path.join(app.save_directory, filename)
-        else:
-            filepath = filename
-
         # area_id=0 → cattura l'intero frame (dopo correzione prospettica se attiva)
         if area_id == 0:
             frame = grab_fresh_frame_for_capture()
@@ -418,6 +419,15 @@ def _process_command(command, log_fn):
         if area_id not in app.rois:
             return (f"ERROR:area {area_id} non esiste  |  "
                     f"aree disponibili: {list(app.rois.keys())}")
+
+        filename = parts[1].strip()
+        if not filename:
+            return "ERROR:nome file mancante"
+
+        if not os.path.isabs(filename):
+            filepath = os.path.join(app.save_directory, filename)
+        else:
+            filepath = filename
 
         dirpath = os.path.dirname(filepath)
         if dirpath:
@@ -651,10 +661,13 @@ class WebcamCaptureGUI:
         frm2 = tk.LabelFrame(p, text="Parametri Webcam", font=("Arial", 9, "bold"))
         frm2.pack(**opt)
 
-        self.contrast_sl   = self._slider(frm2, "Contrasto",   0,   10,  app.webcam_contrast,   self._on_contrast)
-        self.saturation_sl = self._slider(frm2, "Saturazione", 0,   200, app.webcam_saturation, self._on_saturation)
-        self.exposure_sl   = self._slider(frm2, "Esposizione", -13, 0,   app.webcam_exposure,   self._on_exposure)
-        self.focus_sl      = self._slider(frm2, "Focus",       0,   255, app.webcam_focus,      self._on_focus)
+        self.contrast_sl   = self._slider(frm2, "Contrasto",        0,   10,  app.webcam_contrast,  self._on_contrast)
+        self.saturation_sl = self._slider(frm2, "Saturazione",      0,   200, app.webcam_saturation,self._on_saturation)
+        self.shutter_sl    = self._slider(frm2, "Shutter (2^n sec)",-11, -1,  app.webcam_shutter,   self._on_shutter)
+        self.gain_sl       = self._slider(frm2, "Gain / ISO",        0,   255, app.webcam_gain,      self._on_gain)
+        self.focus_sl      = self._slider(frm2, "Focus",             0,   255, app.webcam_focus,     self._on_focus)
+        self.sharp_sl      = self._slider(frm2, "Nitidezza",         0,   255, app.webcam_sharpness, self._on_sharpness)
+
 
         # ── Live View ────────────────────────────
         frm3 = tk.LabelFrame(p, text="Live View", font=("Arial", 9, "bold"))
@@ -797,31 +810,43 @@ class WebcamCaptureGUI:
         tk.Label(p, text="", height=2).pack()  # spazio extra per scroll
 
     def _build_right(self, parent):
-        pf = tk.LabelFrame(parent, text="Anteprima Webcam", font=("Arial", 9, "bold"))
-        pf.pack(fill="both", expand=True, pady=(0, 4))
+        # PanedWindow verticale: l'utente trascina il divisore per ridimensionare
+        # preview e log indipendentemente
+        paned = tk.PanedWindow(parent, orient=tk.VERTICAL,
+                               sashrelief=tk.RAISED, sashwidth=5,
+                               bg="#cccccc")
+        paned.pack(fill="both", expand=True)
+
+        # ── Pannello superiore: anteprima webcam ──
+        pf = tk.LabelFrame(paned, text="Anteprima Webcam", font=("Arial", 9, "bold"))
 
         self.preview_panel = tk.Label(pf, bg="black",
                                       text="Live View non attiva",
                                       fg="white", font=("Arial", 12))
         self.preview_panel.pack(fill="both", expand=True, padx=4, pady=4)
 
-        # Binding mouse per selezione area direttamente sull'anteprima
         self.preview_panel.bind("<ButtonPress-1>",   self._on_preview_press)
         self.preview_panel.bind("<B1-Motion>",        self._on_preview_drag)
         self.preview_panel.bind("<ButtonRelease-1>", self._on_preview_release)
 
-        lf = tk.LabelFrame(parent, text="Log", font=("Arial", 9, "bold"))
-        lf.pack(fill="x", pady=(0, 4))
+        paned.add(pf, stretch="always", minsize=150)
+
+        # ── Pannello inferiore: log scrollabile ──
+        lf = tk.LabelFrame(paned, text="Log", font=("Arial", 9, "bold"))
 
         li = tk.Frame(lf)
         li.pack(fill="both", expand=True, padx=4, pady=4)
 
-        self.log_text = tk.Text(li, height=9, font=("Courier", 8), bg="#f5f5f5")
+        self.log_text = tk.Text(li, height=7, font=("Courier", 8), bg="#f5f5f5",
+                                wrap="none")
         self.log_text.pack(side="left", fill="both", expand=True)
 
-        sb = tk.Scrollbar(li, command=self.log_text.yview)
-        sb.pack(side="right", fill="y")
-        self.log_text.configure(yscrollcommand=sb.set)
+        # Scrollbar verticale
+        sb_v = tk.Scrollbar(li, orient="vertical", command=self.log_text.yview)
+        sb_v.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=sb_v.set)
+
+        paned.add(lf, stretch="never", minsize=80)
 
         app.log_fn = self._log
 
@@ -867,12 +892,6 @@ class WebcamCaptureGUI:
             if app.cap and app.cap.isOpened():
                 app.cap.set(cv2.CAP_PROP_SATURATION, app.webcam_saturation)
 
-    def _on_exposure(self, v):
-        app.webcam_exposure = int(float(v))
-        with app.cam_lock:
-            if app.cap and app.cap.isOpened():
-                app.cap.set(cv2.CAP_PROP_EXPOSURE, app.webcam_exposure)
-
     def _on_focus(self, v):
         app.webcam_focus = int(float(v))
         with app.cam_lock:
@@ -881,6 +900,39 @@ class WebcamCaptureGUI:
                     app.cap.set(cv2.CAP_PROP_FOCUS, app.webcam_focus)
                 except Exception:
                     pass
+
+    def _on_sharpness(self, v):
+        app.webcam_sharpness = int(float(v))
+        with app.cam_lock:
+            if app.cap and app.cap.isOpened():
+                try:
+                    app.cap.set(cv2.CAP_PROP_SHARPNESS, app.webcam_sharpness)
+                except Exception:
+                    pass
+
+    def _on_shutter(self, v):
+        """Shutter speed = CAP_PROP_EXPOSURE su DirectShow.
+        n -> tempo = 2^n secondi  (es. -6 = 1/64 s = 15.6 ms)
+        Valori piu negativi: immagine piu scura, meno banding.
+        Compensare con Gain/ISO se si scurisce troppo.
+        """
+        app.webcam_shutter = int(float(v))
+        ms = round(1000 * (2 ** app.webcam_shutter), 2)
+        with app.cam_lock:
+            if app.cap and app.cap.isOpened():
+                app.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                app.cap.set(cv2.CAP_PROP_EXPOSURE, app.webcam_shutter)
+        self._log(f"[CAM] Shutter: 2^{app.webcam_shutter} = {ms} ms")
+
+    def _on_gain(self, v):
+        """Gain analogico = equivalente ISO.
+        C920: range 0-255. Valori alti = piu luminoso ma piu rumore.
+        Utile per compensare uno shutter speed corto.
+        """
+        app.webcam_gain = int(float(v))
+        with app.cam_lock:
+            if app.cap and app.cap.isOpened():
+                app.cap.set(cv2.CAP_PROP_GAIN, app.webcam_gain)
 
     def _on_camera_change(self, event):
         app.selected_camera = int(self.cam_var.get().split()[-1])
@@ -1197,7 +1249,7 @@ class WebcamCaptureGUI:
             try:
                 bitrate = int(self.can_bitrate_var.get())
             except ValueError:
-                self._log("[CAN] Bitrate non valido")
+                self._log('[CAN] Bitrate non valido')
                 return
             try:
                 _alarm_sender = AlarmCanSender(
@@ -1205,18 +1257,17 @@ class WebcamCaptureGUI:
                     channel=ch,
                     bitrate=bitrate,
                 )
-                self.can_btn.config(text="■  Disconnetti CAN", bg="#ff8c8c")
+                self.can_btn.config(text='■  Disconnetti CAN', bg='#ff8c8c')
                 self.can_status.config(
-                    text=f"● Connesso  CH{ch}  {bitrate//1000}k  ({len(AlarmCanSender.list_alarms())} allarmi)",
-                    fg="green"
+                    text=f'● Connesso  CH{ch}  {bitrate//1000}k  ({len(AlarmCanSender.list_alarms())} allarmi)',
+                    fg='green'
                 )
-                self._log(f"[CAN] Bus aperto — DBC:{dbc}  CH:{ch}  {bitrate}bps")
+                self._log(f'[CAN] Bus aperto — DBC:{dbc}  CH:{ch}  {bitrate}bps')
             except Exception as e:
                 import traceback
-                self._log(f"[CAN] Errore connessione: {e}")
-                self._log(f"[CAN] Dettaglio: {traceback.format_exc().splitlines()[-2]}")
-                self.can_status.config(text="● Errore", fg="orange")
-
+                self._log(f'[CAN] Errore connessione: {e}')
+                self._log(f'[CAN] Dettaglio: {traceback.format_exc().splitlines()[-2]}')
+                self.can_status.config(text='● Errore', fg='orange')
     def _toggle_server(self):
         if app.server_running:
             app.server_running = False

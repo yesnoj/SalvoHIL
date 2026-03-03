@@ -55,7 +55,7 @@ Segui questo ordine nella GUI:
 
 1. Seleziona la **camera** dal menu a tendina (Webcam 0, 1, 2...)
 2. Scegli la **risoluzione** (640×480 / 1280×720 / 1920×1080)
-3. Regola i **parametri webcam** con gli slider (contrasto, saturazione, esposizione, focus)
+3. Regola i **parametri webcam** con gli slider (contrasto, saturazione, shutter, gain, focus, nitidezza)
 4. Clicca **▶ Start Live View** per vedere l'anteprima in tempo reale
 5. Configura le **aree di acquisizione** (vedi sezione dedicata)
 6. Se necessario, configura la **Correzione Prospettica**
@@ -76,6 +76,29 @@ percorso = cattura(area_id=1, nome_file="misura.jpg")
 
 Niente altro. Il file salvato si trova nel percorso restituito.
 
+
+---
+
+## Distribuzione come eseguibile (.exe)
+
+Per distribuire il server senza esporre i sorgenti `.py`:
+
+```bash
+python -m pip install pyinstaller
+python -m PyInstaller --onefile --windowed --add-data "alarm_can_sender.py;." ^
+    --hidden-import "can.interfaces.vector" ^
+    --hidden-import "can.interfaces.socketcan" ^
+    --hidden-import "can.interfaces.pcan" ^
+    --hidden-import "can.interfaces.kvaser" ^
+    --hidden-import "can" ^
+    webcam_capture_server.py
+```
+
+Il file `dist\webcam_capture_server.exe` e autonomo e non richiede Python installato.
+
+> Se `pip install pyinstaller` fallisce, usa `python -m pip install pyinstaller`.
+
+Le immagini vengono salvate nella stessa cartella dell`.exe` se non viene specificato un percorso assoluto (il server gestisce automaticamente la differenza tra esecuzione da `.py` e da `.exe`).
 ---
 
 ## Aree di acquisizione
@@ -90,6 +113,7 @@ Le aree si disegnano direttamente sull'anteprima Live View:
 Per rimuovere un'area: selezionala nella lista e clicca **− Rimuovi**.
 
 Il client usa l'ID numerico (`area_id=1`, `area_id=2`, ...) per specificare quale area catturare.
+`area_id=0` cattura sempre l'**intero frame** (con correzione prospettica applicata se attiva), senza necessità di definire aree.
 
 ---
 
@@ -141,9 +165,14 @@ La sezione **CAN Alarm Sender** appare automaticamente nella barra sinistra solo
 
 1. Clicca **...** per aprire il file picker e selezionare il file `.dbc`
 2. Imposta il **canale** Vector (0 = CH1 in CANalyzer/CANoe)
-3. Clicca **⚡ Connetti CAN** → lo stato diventa `● Connesso CH0 (38 allarmi)`
+3. Imposta il **bitrate** (125000 / 250000 / 500000 / 1000000 bps)
+4. Clicca **⚡ Connetti CAN** → lo stato diventa `● Connesso CH0 250k (38 allarmi)`
 
 Il CAN è indipendente dal server webcam: puoi connettere/disconnettere senza toccare la webcam.
+
+### Trasmissione ciclica
+
+Gli allarmi vengono trasmessi **ciclicamente ogni 20 ms (50 Hz)** finche non vengono cancellati con `cancella_allarme()`. I nodi CAN hanno tipicamente un timeout di 100-500 ms: senza ritrasmissione ciclica il segnale viene considerato "stale" e ignorato.
 
 ### Test standalone del modulo CAN
 
@@ -165,7 +194,7 @@ Cattura l'area specificata e salva il file.
 
 | Parametro | Tipo | Descrizione |
 |---|---|---|
-| `area_id` | int | ID dell'area configurata nella GUI |
+| `area_id` | int | ID dell'area configurata nella GUI. `0` = intero frame |
 | `nome_file` | str | Nome file (`"misura.jpg"`) o percorso assoluto (`"C:/foto/img.png"`). Il formato dipende dall'estensione (`.jpg`, `.png`, `.bmp`, `.tiff`) |
 | `porta` | int | Porta TCP del server (default: `5005`) |
 
@@ -192,6 +221,9 @@ else:
     print(f"Non disponibile: {msg}")
 ```
 
+
+
+Il server risponde `READY` non appena la webcam e aperta, anche senza aree definite (in quel caso `aree=[0]`).
 ---
 
 ### `mostra_allarme(alarm_id, porta=5005)`
@@ -213,7 +245,7 @@ Se c'era già un allarme attivo, viene azzerato automaticamente prima di inviare
 
 ### `cancella_allarme(porta=5005)`
 
-Azzera il segnale CAN dell'ultimo allarme attivato. Non solleva eccezioni se non c'era nessun allarme attivo.
+Azzera il segnale CAN dell'ultimo allarme attivato e ferma la ritrasmissione ciclica. Non solleva eccezioni se non c'era nessun allarme attivo.
 
 ---
 
@@ -280,6 +312,7 @@ Comandi in testo terminati da `\n`.
 │                     CAPTURE / STATUS / SHOW_ALARM / ...       │
 │                               ↓                                │
 │  [AlarmCanSender]   Bus Vector CAN → display fisico           │
+│    [CAN Cyclic Thread]  ritrasmette allarme ogni 20 ms        │
 │                     (presente solo se alarm_can_sender.py      │
 │                      è nella cartella e CAN è connesso)        │
 └────────────────────────────────────────────────────────────────┘
@@ -300,12 +333,16 @@ I lock `cam_lock` e `frame_lock` garantiscono thread-safety tra Grabber, GUI e S
 
 Tutti regolabili in tempo reale dagli slider senza riavviare:
 
-| Parametro | Range | Note |
+| Slider | Range | Note |
 |---|---|---|
-| Contrasto | 0 – 10 | |
-| Saturazione | 0 – 200 | |
-| Esposizione | -13 – 0 | Valori negativi = manuale |
-| Focus | 0 – 255 | Autofocus disabilitato all'avvio |
+| Contrasto | 0 - 10 | |
+| Saturazione | 0 - 200 | |
+| Shutter (2^n sec) | -11 - -1 | Velocita otturatore (`CAP_PROP_EXPOSURE`). Valori piu negativi = posa piu corta. **Limite -11**: su Logitech C920 valori inferiori fanno scattare l'auto-exposure del driver silenziosamente |
+| Gain / ISO | 0 - 255 | Guadagno analogico (`CAP_PROP_GAIN`), equivalente all'ISO. Alza il gain per compensare uno shutter corto |
+| Focus | 0 - 255 | Autofocus disabilitato all'avvio |
+| Nitidezza | 0 - 255 | `CAP_PROP_SHARPNESS` - non tutti i driver lo supportano |
+
+> **Bande orizzontali sul display**: abbassa lo Shutter finche spariscono, poi alza il Gain per compensare la luminosita persa. E la stessa tecnica shutter veloce + ISO alto delle fotocamere.
 
 ---
 
@@ -315,6 +352,7 @@ Tutti regolabili in tempo reale dagli slider senza riavviare:
 - La **rotazione** è configurata per area nella GUI e applicata automaticamente al salvataggio — il client non deve fare nulla di speciale.
 - Le **sottocartelle** nel percorso file vengono create automaticamente.
 - OpenCV usa **DirectShow** (`cv2.CAP_DSHOW`) su Windows per evitare ritardi di inizializzazione.
+- Il parametro `app_name` **non** viene passato a `can.interface.Bus()` perche richiederebbe la registrazione nel Vector Hardware Configuration. Se si desidera usarlo, registrare prima il nome in Vector Hardware Config.
 - I nomi `msg` e `sig` in `ALARM_DICT` dentro `alarm_can_sender.py` devono corrispondere esattamente ai nomi nel file `.dbc` (case-sensitive). Verificare con CANdb++ prima del deploy.
 
 ---
