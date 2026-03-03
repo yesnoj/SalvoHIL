@@ -16,6 +16,10 @@ Uso diretto:
 
 Test standalone:
     python alarm_can_sender.py
+
+Nomi messaggi e segnali verificati su:
+    SpecialtyCVT_VB1_RevC7.dbc
+    SpecialtyCVT_VB2_RevC7.dbc
 """
 
 import threading
@@ -30,64 +34,106 @@ except ImportError:
     CAN_AVAILABLE = False
     logging.warning("python-can o cantools non installati. Funzionalita CAN disabilitata.")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  Dizionario A-code → segnale CAN
-#
-#  Struttura: { alarm_id: {msg: nome_messaggio_DBC, sig: nome_segnale_DBC, val: valore} }
-#
-#  IMPORTANTE: msg e sig devono corrispondere ai nomi ESATTI nel file .dbc
-#  (case-sensitive). Verificare con CANdb++ prima del deploy.
-#  Il valore 0 viene usato automaticamente dal metodo clear_alarm().
+#  ALARM_DICT
+#  Tutti i nomi msg/sig verificati contro SpecialtyCVT_VB1_RevC7.dbc e VB2.
+#  Formato singolo:   {"msg": "...", "sig": "...", "val": N}
+#  Formato multiplo:  {"signals": [{"msg":..., "sig":..., "val":N}, ...]}
 # ─────────────────────────────────────────────────────────────────────────────
 ALARM_DICT = {
-    # ── Livello 0-a  BLU / safety buzzer (azione sicurezza richiesta) ─────────
-    "A001": {"msg": "PB_UCM_Status1_27",  "sig": "ParkBrakeWarn",       "val": 1},
-    "A002": {"msg": "PB_UCM_Status1_27",  "sig": "ParkBrakeActWarn",    "val": 1},
-    "A029": {"msg": "PB_UCM_Status1_27",  "sig": "PTOWarnSts",          "val": 1},
-    # ── Livello 0-b  BLU / action required (azione operatore richiesta) ───────
-    "A005": {"msg": "PB_UCM_Status1_27",  "sig": "RlsHBWarn",           "val": 1},
-    "A006": {"msg": "PB_UCM_Status1_27",  "sig": "NeutralWarn",         "val": 1},
-    "A007": {"msg": "PB_UCM_Status1_27",  "sig": "ClutchWarn",          "val": 1},
-    # ── Livello 1  ROSSO + "STOP" / Critical Buzzer / Red Stop Lamp ──────────
-    "A101": {"msg": "PB_Warnings1_27",    "sig": "DrvlOilPrsWarn",      "val": 2},
-    "A102": {"msg": "PB_Warnings1_27",    "sig": "DrvlOilTmpWarn",      "val": 2},
-    "A103": {"msg": "PB_Warnings1_27",    "sig": "EngCoolTmpHiWarn",    "val": 2},
-    "A104": {"msg": "PB_Warnings1_27",    "sig": "EngOilPrsWarn",       "val": 2},
-    "A105": {"msg": "PB_Warnings1_27",    "sig": "EngOilTmpWarn",       "val": 2},
-    "A106": {"msg": "PB_Warnings1_27",    "sig": "HydOilTmpWarn",       "val": 2},
-    "A107": {"msg": "PB_Warnings1_27",    "sig": "TransmOilTmpWarn",    "val": 2},
-    "A108": {"msg": "PB_Warnings1_27",    "sig": "AirFltrWarn",         "val": 2},
-    "A109": {"msg": "PB_Warnings1_27",    "sig": "ChrgSysWarn",         "val": 2},
-    # ── Livello 2  ROSSO / Critical Buzzer / Red Stop Lamp ───────────────────
-    "A202": {"msg": "PB_Warnings1_27",    "sig": "TransmWarnSts",       "val": 4},
-    "A203": {"msg": "PB_Warnings1_27",    "sig": "TransmWarnSts",       "val": 8},
-    "A204": {"msg": "PB_Warnings2_27",    "sig": "FuelLvlWarn",         "val": 2},
-    "A205": {"msg": "PB_Warnings2_27",    "sig": "DEFLvlWarn",          "val": 2},
-    "A210": {"msg": "PB_Warnings2_27",    "sig": "BrakeSysWarn",        "val": 2},
-    "A221": {"msg": "PB_Warnings2_27",    "sig": "SteerSysWarn",        "val": 2},
-    # ── Livello 3  ARANCIONE / Non-Critical Buzzer / Amber Lamp ──────────────
-    "A301": {"msg": "PB_Warnings1_27",    "sig": "DrvlOilPrsWarn",      "val": 1},
-    "A302": {"msg": "PB_Warnings1_27",    "sig": "DrvlOilTmpWarn",      "val": 1},
-    "A303": {"msg": "PB_Warnings1_27",    "sig": "EngCoolTmpHiWarn",    "val": 1},
-    "A304": {"msg": "PB_Warnings1_27",    "sig": "EngOilPrsWarn",       "val": 1},
-    "A305": {"msg": "PB_Warnings1_27",    "sig": "EngOilTmpWarn",       "val": 1},
-    "A306": {"msg": "PB_Warnings1_27",    "sig": "HydOilTmpWarn",       "val": 1},
-    "A307": {"msg": "PB_Warnings1_27",    "sig": "TransmOilTmpWarn",    "val": 1},
-    "A308": {"msg": "PB_Warnings1_27",    "sig": "AirFltrWarn",         "val": 1},
-    "A309": {"msg": "PB_Warnings1_27",    "sig": "ChrgSysWarn",         "val": 1},
-    "A340": {"msg": "PB_Warnings2_27",    "sig": "FuelLvlWarn",         "val": 1},
-    "A341": {"msg": "PB_Warnings2_27",    "sig": "DEFLvlWarn",          "val": 1},
-    "A348": {"msg": "PB_Warnings2_27",    "sig": "AdBlueQualWarn",      "val": 1},
-    # ── Livello 4  ARANCIONE / no buzzer ─────────────────────────────────────
-    "A401": {"msg": "PB_Warnings3_27",    "sig": "ServiceWarn",         "val": 1},
-    "A402": {"msg": "PB_Warnings3_27",    "sig": "ServiceOverdueWarn",  "val": 1},
-    "A414": {"msg": "PB_Warnings3_27",    "sig": "FilterMaintWarn",     "val": 1},
-    # ── Livello 5  BLU / single beep ─────────────────────────────────────────
-    "A501": {"msg": "PB_Warnings3_27",    "sig": "InfoWarn1",           "val": 1},
-    "A502": {"msg": "PB_Warnings3_27",    "sig": "InfoWarn2",           "val": 1},
-    "A503": {"msg": "PB_Warnings3_27",    "sig": "InfoWarn3",           "val": 1},
+
+    # ── Level 0-a / 0-b  (BLU popup) ─────────────────────────────────────────
+    "A001": {"msg": "PB_UCM_Status1_27",  "sig": "TransmWarnSts",           "val": 4},
+    "A002": {"msg": "PB_UCM_Status1_27",  "sig": "TransmWarnSts",           "val": 12},
+    "A005": {"msg": "PB_UCM_Status1_27",  "sig": "TransmWarnSts",           "val": 3},
+    "A006": {"msg": "PB_UCM_Status1_27",  "sig": "TransmWarnSts",           "val": 1},
+    "A007": {"msg": "PB_UCM_Status1_27",  "sig": "TransmWarnSts",           "val": 2},
+    "A029": {"msg": "PB_WARNINGS2_27",    "sig": "PTO_OutSeatWarn",         "val": 1},
+
+    # ── Level 1  (ROSSO + STOP + Critical Buzzer) ─────────────────────────────
+    "A101": {"msg": "PB_WARNINGS1_27",    "sig": "DrvlOilPrsWarn",          "val": 2},
+    "A102": {"msg": "PB_WARNINGS1_27",    "sig": "DrvlOilTempWarn",         "val": 4},
+    "A103": {"msg": "PB_EDC2BC_00",       "sig": "EngOverTempPreWaiting",   "val": 2},
+    "A104": {"msg": "PB_EDC2BC_00",       "sig": "EngOilPrsLo",             "val": 1},
+    "A105": {"msg": "PB_ENG06_00",        "sig": "EmergRstart",             "val": 1},
+    "A106": {"msg": "PB_ENG06_00",        "sig": "EmergRstart",             "val": 2},
+    "A107": {"msg": "PB_ENG06_00",        "sig": "EmergRstart",             "val": 3},
+    "A108": {"signals": [
+        {"msg": "DPFC1_00", "sig": "AT_DPF_Sts",          "val": 2},
+        {"msg": "DPFC1_00", "sig": "AT_DPF_ActvRegenSts", "val": 0},
+    ]},
+    "A109": {"msg": "PB_WARNINGS1_27",    "sig": "HydrostatTransmOilPrsWarn", "val": 2},
+
+    # ── Level 2  (ROSSO + Critical Buzzer) ───────────────────────────────────
+    "A202": {"msg": "PB_WARNINGS1_27",    "sig": "DrvlOilTempWarn",         "val": 4},
+    "A203": {"msg": "PB_EDC2BC_00",       "sig": "EngOverTempPreWaiting",   "val": 2},
+    "A204": {"msg": "PB_EDC2BC_00",       "sig": "EngOilPrsLo",             "val": 1},
+    "A205": {"signals": [
+        {"msg": "PB_ENG06_00", "sig": "CmplntModeStrongInduc", "val": 1},
+        {"msg": "PB_ENG06_00", "sig": "DEF_Lev",               "val": 3},
+    ]},
+    "A206": {"signals": [
+        {"msg": "PB_ENG06_00", "sig": "CmplntModeStrongInduc", "val": 2},
+        {"msg": "PB_ENG06_00", "sig": "DEF_Qual",              "val": 3},
+    ]},
+    "A210": {"signals": [
+        {"msg": "PB_ENG06_00", "sig": "CmplntModeStrongInduc", "val": 0},
+        {"msg": "PB_ENG06_00", "sig": "DEF_TechFail",          "val": 3},
+    ]},
+    "A220": {"msg": "PB_WARNINGS1_27",    "sig": "DrvlOilPrsWarn",          "val": 2},
+    "A221": {"msg": "PB_WARNINGS3_27",    "sig": "SteerLoPrsWarn",          "val": 1},
+
+    # ── Level 3  (ARANCIONE + Non-Critical Buzzer) ───────────────────────────
+    "A302": {"msg": "PB_EDC2BC_00",       "sig": "WaterInFuel",             "val": 1},
+    "A303": {"msg": "FPTO_24",            "sig": "PTO_SysSts",              "val": 1},
+    "A304": {"msg": "PB_WARNINGS2_27",    "sig": "PTO_AntistlPrev",         "val": 1},
+    "A305": {"signals": [
+        {"msg": "PB_ENG06_00", "sig": "CmplntModeStrongInduc", "val": 0},
+        {"msg": "PB_ENG06_00", "sig": "DEF_TechFail",          "val": 2},
+    ]},
+    "A306": {"signals": [
+        {"msg": "PB_ENG06_00", "sig": "CmplntModeStrongInduc", "val": 0},
+        {"msg": "PB_ENG06_00", "sig": "DEF_Lev",               "val": 1},
+    ]},
+    "A307": {"signals": [
+        {"msg": "PB_ENG06_00", "sig": "CmplntModeStrongInduc", "val": 0},
+        {"msg": "PB_ENG06_00", "sig": "DEF_Qual",              "val": 1},
+    ]},
+    "A308": {"msg": "PB_ENG06_00",        "sig": "ValidnSts",               "val": 1},
+    "A309": {"msg": "PB_ENG06_00",        "sig": "ValidnSts",               "val": 2},
+    "A321": {"msg": "PB_EGR_Inducement_00","sig": "EGR_DPF_OpInducSev",    "val": 1},
+    "A322": {"msg": "PB_WARNINGS4_27",    "sig": "CAT4_ModClogFilt",        "val": 1},
+    "A323": {"msg": "PB_WARNINGS4_27",    "sig": "CAT4_FiltSaturtnAlrm",    "val": 1},
+    "A324": {"msg": "PB_WARNINGS4_27",    "sig": "DoorOpend_orCabAirLeak",  "val": 1},
+    "A329": {"msg": "PB_WARNINGS2_27",    "sig": "PBrakeManActvReqWarn",    "val": 1},
+    "A330": {"msg": "PB_WARNINGS1_27",    "sig": "HydrostatTransmFiltClogWarn", "val": 1},
+    "A331": {"msg": "PB_WARNINGS1_27",    "sig": "HydrostatTransmOilPrsWarn",   "val": 1},
+    "A332": {"msg": "PB_WARNINGS1_27",    "sig": "DrvlOilTempWarn",         "val": 2},
+    "A333": {"msg": "PB_UCM_Status1_27",  "sig": "VehImmobztnSts",          "val": 1},
+    "A334": {"msg": "PB_WARNINGS1_27",    "sig": "DrvlOilPrsWarn",          "val": 1},
+    "A335": {"msg": "PB_EDC2BC_00",       "sig": "EngOverTempPreWaiting",   "val": 1},
+    "A336": {"msg": "PB_WARNINGS2_27",    "sig": "TurnPTO_OFF_Warn",        "val": 1},
+    "A337": {"msg": "PB_WARNINGS2_27",    "sig": "PTO_CnflctWarn",          "val": 1},
+    "A338": {"msg": "PB_WARNINGS2_27",    "sig": "PTO_OverloadPopup",       "val": 1},
+    "A339": {"msg": "PB_WARNINGS1_27",    "sig": "AirBrakeLoPrsWarn",       "val": 1},
+    "A340": {"msg": "PB_WARNINGS4_27",    "sig": "PTSS_MalfunWarn",         "val": 1},
+    "A341": {"msg": "PB_WARNINGS2_27",    "sig": "FSUS_CalibrReqrdWarn",    "val": 1},
+    "A348": {"msg": "PB_WARNINGS4_27",    "sig": "PTSS_MisuseWarning",      "val": 1},
+
+    # ── Level 4  (ARANCIONE + No Buzzer) ─────────────────────────────────────
+    "A401": {"msg": "PB_ENG06_00",        "sig": "ClogAirFiltSts",          "val": 1},
+    "A402": {"msg": "PB_UserSet_27",      "sig": "Altern_1Warn",            "val": 1},
+    "A414": {"msg": "PB_WARNINGS4_27",    "sig": "ServWarn",                "val": 1},
+
+    # ── Level 5  (BLU + Single Beep) ─────────────────────────────────────────
+    "A501": {"msg": "DPFC1_00",           "sig": "DPF_ActvRegenInhInhSw",   "val": 1},
+    "A502": {"msg": "PB_WARNINGS3_27",    "sig": "CRPM_AutoFunctWarn",      "val": 1},
+    "A503": {"msg": "PB_WARNINGS3_27",    "sig": "CRPM_AutoFunctWarn",      "val": 2},
 }
+
+# A301 non è nel dizionario: attivato da tensione hardware (<9V), non simulabile via CAN.
+# A335 richiede RPM>500 oltre al segnale CAN: il segnale viene inviato ma la condizione
+#       RPM deve essere soddisfatta nel veicolo per visualizzare il warning.
 
 
 class AlarmCanSender:
@@ -131,15 +177,18 @@ class AlarmCanSender:
         )
 
         self._lock         = threading.Lock()
-        self._active_alarm = None   # dict con {msg, sig, val, id} dell'allarme attivo
+        self._active_alarm = None   # dict con i dati dell'allarme attivo
         logging.info(
             f"AlarmCanSender pronto — DBC:{dbc_path}  CH:{channel}  app:{app_name}"
         )
 
     # ─────────────────────── metodi privati ───────────────────────────────────
 
-    def _send_signal(self, msg_name, sig_name, value):
-        """Codifica e invia un singolo segnale CAN (tutti gli altri segnali = 0)."""
+    def _send_one_signal(self, msg_name, sig_name, value):
+        """
+        Codifica e invia un singolo frame CAN con un segnale impostato al valore
+        specificato (tutti gli altri segnali del messaggio = 0).
+        """
         msg_def = self._db.get_message_by_name(msg_name)
         data = {s.name: 0 for s in msg_def.signals}
         data[sig_name] = value
@@ -157,11 +206,28 @@ class AlarmCanSender:
             f"data=[{' '.join(f'{b:02X}' for b in encoded)}]"
         )
 
+    def _send_alarm_signals(self, entry, value_override=None):
+        """
+        Invia tutti i segnali associati a un allarme.
+        Supporta sia la forma singola {msg, sig, val} che la forma
+        multi-segnale {signals: [{msg, sig, val}, ...]}.
+
+        Se value_override è fornito (tipicamente 0 per il clear), sostituisce
+        tutti i val originali.
+        """
+        if "signals" in entry:
+            for s in entry["signals"]:
+                v = value_override if value_override is not None else s["val"]
+                self._send_one_signal(s["msg"], s["sig"], v)
+        else:
+            v = value_override if value_override is not None else entry["val"]
+            self._send_one_signal(entry["msg"], entry["sig"], v)
+
     def _clear_active(self):
-        """Azzera il segnale dell'allarme correntemente attivo."""
+        """Azzera tutti i segnali dell'allarme correntemente attivo."""
         e = self._active_alarm
-        self._send_signal(e["msg"], e["sig"], 0)
-        logging.info(f"Allarme {e['id']} cancellato (segnale → 0)")
+        self._send_alarm_signals(e, value_override=0)
+        logging.info(f"Allarme {e['id']} cancellato (segnali → 0)")
         self._active_alarm = None
 
     # ─────────────────────── API pubblica ─────────────────────────────────────
@@ -178,7 +244,7 @@ class AlarmCanSender:
 
         Ritorna
         -------
-        True  se alarm_id è nel dizionario e il frame è stato inviato
+        True  se alarm_id è nel dizionario e il/i frame sono stati inviati
         False se alarm_id è sconosciuto
         """
         alarm_id = alarm_id.upper().strip()
@@ -190,14 +256,14 @@ class AlarmCanSender:
         if self._active_alarm is not None:
             self._clear_active()
 
-        self._send_signal(entry["msg"], entry["sig"], entry["val"])
+        self._send_alarm_signals(entry)
         self._active_alarm = {**entry, "id": alarm_id}
         logging.info(f"Allarme {alarm_id} attivato")
         return True
 
     def clear_alarm(self):
         """
-        Azzera il segnale CAN dell'ultimo allarme attivato.
+        Azzera i segnali CAN dell'ultimo allarme attivato.
 
         Ritorna
         -------
@@ -225,6 +291,10 @@ class AlarmCanSender:
         """Ritorna la lista ordinata di tutti gli A-code supportati."""
         return sorted(ALARM_DICT.keys())
 
+    @staticmethod
+    def list_todo():
+        """A301 non è nel dizionario: attivato da tensione hardware (<9V), non simulabile via CAN."""
+        return ["A301"]
 
 # ─────────────────────────────────────────────
 #  Test standalone
@@ -235,6 +305,8 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
     print("=== Test AlarmCanSender ===")
+    print(f"Allarmi totali: {len(AlarmCanSender.list_alarms())}")
+    print(f"TODO da verificare in DBC: {AlarmCanSender.list_todo()}")
 
     if not CAN_AVAILABLE:
         print("ERRORE: python-can o cantools non installati.")
